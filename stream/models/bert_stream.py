@@ -7,8 +7,8 @@ import torch
 from torch import nn
 from transformers import BertConfig, BertForMaskedLM
 
-from ..dataio import ItemVocab
-from . import BaseStreamModel
+from stream.dataio import ItemVocab
+from stream.models import BaseStreamModel
 
 
 class BertStreamModel(BaseStreamModel):

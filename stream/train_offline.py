@@ -11,31 +11,31 @@ from sklearn.cluster import KMeans
 from torch.optim import AdamW
 from tqdm import tqdm
 
-from .config import StreamConfig
-from .dataio import ItemVocab, build_dataloader, load_all_splits
-from .models.causal_lm_stream import CausalLMStreamModel
-from .models.bert_stream import BertStreamModel
-from .state_adapter import ItemHead, ItemHeadInit
-from .subspace import compute_subspace
-from .utils import get_logger, set_seed
+from config import StreamConfig
+from dataio import ItemVocab, build_dataloader, load_all_splits
+from models.causal_lm_stream import CausalLMStreamModel
+from models.bert_stream import BertStreamModel
+from state_adapter import ItemHead, ItemHeadInit
+from subspace import compute_subspace
+from utils import get_logger, set_seed
 
 LOGGER = get_logger(__name__)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Offline training for STREAM")
-    parser.add_argument("--data_dir", type=Path, required=True)
-    parser.add_argument("--out_dir", type=Path, required=True)
-    parser.add_argument("--model_type", choices=["causal", "bert"], required=True)
-    parser.add_argument("--pretrained_name_or_path", type=str, default="gpt2")
+    parser.add_argument("--data_dir", type=Path, default="/home/zj/code/STREAM/Yelp")
+    parser.add_argument("--out_dir", type=Path, default="/home/zj/code/STREAM/Yelp/bert")
+    parser.add_argument("--model_type", choices=["causal", "bert"], default="bert")
+    parser.add_argument("--pretrained_name_or_path", type=str, default="/home/zj/model/Llama-2-7b-hf")
     parser.add_argument("--rank_r", type=int, default=32)
     parser.add_argument("--router_k", type=int, default=16)
     parser.add_argument("--subspace_mode", choices=["gradcov", "pca"], default="gradcov")
-    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--seed", type=int, default=17)
-    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--device", type=str, default="cuda")
     return parser.parse_args()
 
 
@@ -86,6 +86,15 @@ def build_router(model, dataloader, router_k: int, device) -> Dict:
     return {"centers": centers}
 
 
+def build_item_name_map(item_vocab: ItemVocab) -> dict[int, str]:
+    m = {}
+    for i in range(item_vocab.num_items):
+        meta = item_vocab.meta_of(i)
+        name = meta.get("title") or meta.get("name") or ""
+        m[i] = name
+    return m
+
+
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -98,7 +107,8 @@ def main() -> None:
     splits = load_all_splits(args.data_dir)
 
     if args.model_type == "causal":
-        model = CausalLMStreamModel(args.pretrained_name_or_path, item_vocab, device)
+        item_name_map = build_item_name_map(item_vocab)
+        model = CausalLMStreamModel(args.pretrained_name_or_path, item_vocab, device, tokenizer_name_or_path=None, torch_dtype=torch.float16, device_map="auto", item_name_map=item_name_map)
         tokenizer = model.tokenizer
     else:
         model = BertStreamModel(item_vocab, device)
@@ -131,6 +141,8 @@ def main() -> None:
 
     subspace = compute_subspace(model, eval_loader, rank=args.rank_r, mode=args.subspace_mode, device=device)
     subspace.save(out_dir)
+
+
     U = subspace.basis.to(device)
 
     item_head = ItemHead(rank=args.rank_r, num_items=item_vocab.num_items, device=device)

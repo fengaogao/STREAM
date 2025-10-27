@@ -115,19 +115,36 @@ def collect_category_gradients(
     model_type: str,
     device: torch.device,
     max_batches: Optional[int] = None,
+    min_samples: int = 20,
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, int]]:
-    """Aggregate mean positive gradients for each category."""
+    """Aggregate whitened category gradients aligned with the training objective."""
 
     category_sums: Dict[str, torch.Tensor] = {}
     counts: Dict[str, int] = {}
     processed = 0
+    feature_dim: Optional[int] = None
+    total_sum: Optional[torch.Tensor] = None
+    total_sq_sum: Optional[torch.Tensor] = None
+    total_count = 0
+
     for batch in tqdm(dataloader, desc="collect-gradients", leave=False):
         batch_device = move_batch_to_device(batch, device)
         grads = model.stream_positive_gradients(batch_device)
         targets = extract_targets_from_batch(batch_device, model_type)
         if grads is None:
             continue
-        grads = grads.detach()
+        grads = grads.detach().to(device)
+
+        if feature_dim is None:
+            feature_dim = grads.size(-1)
+            total_sum = torch.zeros(feature_dim, device=device)
+            total_sq_sum = torch.zeros(feature_dim, device=device)
+        assert total_sum is not None and total_sq_sum is not None
+
+        total_sum += grads.sum(dim=0)
+        total_sq_sum += (grads * grads).sum(dim=0)
+        total_count += grads.size(0)
+
         for grad, target_idx in zip(grads, targets.tolist()):
             if target_idx < 0:
                 continue
@@ -143,21 +160,40 @@ def collect_category_gradients(
         processed += 1
         if max_batches is not None and processed >= max_batches:
             break
-    category_means = {}
+
+    if total_count == 0 or feature_dim is None or total_sum is None or total_sq_sum is None:
+        return {}, {}
+
+    # whitening statistics
+    global_mean = total_sum / float(total_count)
+    global_var = total_sq_sum / float(total_count) - global_mean * global_mean
+    global_std = torch.sqrt(torch.clamp(global_var, min=1e-6))
+
+    # build whitened category deltas: E[g|c] - E[g|~c], then / std
+    category_deltas: Dict[str, torch.Tensor] = {}
     for category, total in category_sums.items():
         cnt = counts[category]
-        if cnt > 0:
-            category_means[category] = total / float(cnt)
-    return category_means, counts
+        if cnt < max(min_samples, 1):
+            continue
+        mean_grad = total / float(cnt)
+        rest_cnt = total_count - cnt
+        if rest_cnt <= 0:
+            continue
+        rest_mean = (total_sum - total) / float(rest_cnt)
+        delta = mean_grad - rest_mean
+        whitened = delta / global_std
+        category_deltas[category] = whitened
 
+    filtered_counts = {c: counts[c] for c in category_deltas.keys()}
+    return category_deltas, filtered_counts
 
 def compute_alignment(
     basis: torch.Tensor,
     subspace_meta: Mapping[str, object],
-    category_means: Mapping[str, torch.Tensor],
+    category_vectors: Mapping[str, torch.Tensor],
     category_counts: Mapping[str, int],
 ) -> AlignmentResult:
-    """Project category mean gradients onto the learned basis."""
+    """Project category vectors (whitened deltas) onto the learned basis."""
 
     directions = [basis[:, i] for i in range(basis.size(1))]
     direction_labels: List[str] = []
@@ -169,11 +205,11 @@ def compute_alignment(
     else:
         direction_labels = [f"dir_{i+1}" for i in range(len(directions))]
 
-    category_list = direction_labels if direction_labels else sorted(category_means.keys())
-    # Ensure we only keep categories we observed
-    category_list = [c for c in category_list if c in category_means]
+    category_list = direction_labels if direction_labels else sorted(category_vectors.keys())
+    category_list = [c for c in category_list if c in category_vectors]
     if not category_list:
-        category_list = sorted(category_means.keys())
+        category_list = sorted(category_vectors.keys())
+
     row_labels = [
         direction_labels[i] if i < len(direction_labels) else f"dir_{i+1}" for i in range(len(directions))
     ]
@@ -181,10 +217,11 @@ def compute_alignment(
     for i, direction in enumerate(directions):
         direction = direction / direction.norm().clamp_min(1e-8)
         for j, category in enumerate(category_list):
-            vec = category_means[category]
+            vec = category_vectors[category]
             vec = vec / vec.norm().clamp_min(1e-8)
             cos_matrix[i, j] = torch.dot(direction, vec).item()
-    # Diagnostics
+
+    # diagnostics
     limit = min(cos_matrix.size(0), cos_matrix.size(1))
     diag = torch.diagonal(cos_matrix[:limit, :limit])
     energy_total = float(torch.sum(cos_matrix ** 2).item())
@@ -195,10 +232,17 @@ def compute_alignment(
         off_diag[idx, idx] = 0.0
     max_cross = float(torch.max(off_diag.abs()).item()) if off_diag.numel() else 0.0
     mean_cross = float(off_diag.abs().mean().item()) if off_diag.numel() else 0.0
+    mean_diag = float(diag.mean().item()) if diag.numel() else float("nan")
+    mean_abs_diag = float(diag.abs().mean().item()) if diag.numel() else float("nan")
+    mean_abs_off = float(off_diag.abs().mean().item()) if off_diag.numel() else float("nan")
+
     metrics = {
         "diag_ratio": diag_ratio,
         "max_cross": max_cross,
         "mean_cross": mean_cross,
+        "mean_diag": mean_diag,
+        "mean_abs_diag": mean_abs_diag,
+        "mean_abs_offdiag": mean_abs_off,
         "num_directions": int(cos_matrix.size(0)),
         "num_categories": int(cos_matrix.size(1)),
     }
@@ -209,7 +253,6 @@ def compute_alignment(
         metrics=metrics,
         counts={c: int(category_counts.get(c, 0)) for c in category_list},
     )
-
 
 def plot_alignment_heatmap(result: AlignmentResult, output_path: Path) -> None:
     plt.figure(figsize=(0.8 * len(result.col_labels) + 4, 0.8 * len(result.row_labels) + 4))
@@ -419,7 +462,9 @@ def run_experiments(args: argparse.Namespace) -> None:
     )
     if not category_means:
         raise RuntimeError("No category gradients were collected; check data and metadata availability.")
+
     alignment = compute_alignment(basis, subspace.meta, category_means, counts)
+
     heatmap_path = output_dir / "experiment_a_heatmap.png"
     plot_alignment_heatmap(alignment, heatmap_path)
     metrics_path = output_dir / "experiment_a_metrics.json"

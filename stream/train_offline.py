@@ -212,7 +212,7 @@ def compute_category_semantic_subspace(
     global_var = torch.clamp(global_var, min=1e-6)
     global_std = torch.sqrt(global_var)
 
-    category_contrasts: List[Tuple[str, torch.Tensor, torch.Tensor, int]] = []
+    category_contrasts: Dict[str, Tuple[torch.Tensor, torch.Tensor, int]] = {}
     for category, grad_sum in category_sums.items():
         count = category_counts.get(category, 0)
         if count < min_samples_per_category:
@@ -224,57 +224,77 @@ def compute_category_semantic_subspace(
         rest_mean = (total_sum - grad_sum) / float(rest_count)
         delta = mean_grad - rest_mean
         whitened_delta = delta / global_std
-        category_contrasts.append((category, delta, whitened_delta, count))
+        category_contrasts[category] = (delta, whitened_delta, count)
 
     if not category_contrasts:
         LOGGER.warning("No category passed the minimum sample threshold, fallback to %s", fallback_mode)
         return compute_subspace(model, dataloader, rank=max_rank, mode=fallback_mode, device=device)
 
-    category_contrasts.sort(key=lambda item: item[2].norm().item(), reverse=True)
+    # choose categories prioritising user-provided order, falling back to energy ranking
+    energy_map = {cat: category_contrasts[cat][1].norm().item() for cat in category_contrasts}
+    ordered = [cat for cat in category_order if cat in category_contrasts]
+    remaining = [cat for cat in category_contrasts.keys() if cat not in ordered]
+    ordered.extend(sorted(remaining, key=lambda c: energy_map[c], reverse=True))
+    if len(ordered) > max_rank:
+        # keep the most energetic categories when truncating beyond the requested rank
+        ordered = sorted(ordered, key=lambda c: energy_map[c], reverse=True)[:max_rank]
 
-    orthogonal_whitened: List[torch.Tensor] = []
-    orthogonal_vectors: List[torch.Tensor] = []
+    whitened_matrix: List[torch.Tensor] = []
+    deltas: List[torch.Tensor] = []
     meta_categories: List[Dict] = []
 
-    for category, delta, whitened_delta, count in category_contrasts:
-        residual = whitened_delta.clone()
-        for existing in orthogonal_whitened:
-            projection = torch.dot(existing, residual)
-            residual = residual - projection * existing
-        norm = residual.norm()
-        if norm < 1e-6:
-            continue
-        residual = residual / norm
-        direction = residual * global_std
-        direction_norm = direction.norm()
-        if direction_norm < 1e-6:
-            continue
-        direction = direction / direction_norm
-        alignment = torch.dot(direction, delta)
-        if alignment < 0:
-            direction = -direction
-            residual = -residual
-            alignment = -alignment
-        orthogonal_whitened.append(residual)
-        orthogonal_vectors.append(direction)
+    for category in ordered:
+        delta, whitened_delta, count = category_contrasts[category]
+        whitened_matrix.append(whitened_delta)
+        deltas.append(delta)
         meta_categories.append(
             {
                 "category": category,
                 "count": int(count),
                 "share": float(count / total_count),
-                "sensitivity": float(alignment.item()),
+                "energy": float(whitened_delta.norm().item()),
             }
         )
-        if len(orthogonal_vectors) >= max_rank:
-            break
+
+    if not whitened_matrix:
+        LOGGER.warning("Selected categories list is empty after filtering, fallback to %s", fallback_mode)
+        return compute_subspace(model, dataloader, rank=max_rank, mode=fallback_mode, device=device)
+
+    whitened_stack = torch.stack(whitened_matrix, dim=1)
+    gram = whitened_stack.t() @ whitened_stack
+    eps = 1e-6 * torch.eye(gram.size(0), device=gram.device)
+    gram = gram + eps
+    evals, evecs = torch.linalg.eigh(gram)
+    evals = torch.clamp(evals, min=1e-8)
+    inv_sqrt = evecs @ torch.diag(evals.rsqrt()) @ evecs.t()
+    orthonormal_whitened = whitened_stack @ inv_sqrt
+
+    orthogonal_vectors: List[torch.Tensor] = []
+    kept_meta: List[Dict] = []
+    for idx in range(orthonormal_whitened.size(1)):
+        raw_direction = orthonormal_whitened[:, idx] * global_std
+        norm = raw_direction.norm()
+        if norm < 1e-6:
+            continue
+        raw_direction = raw_direction / norm
+        alignment = torch.dot(raw_direction, deltas[idx])
+        if alignment < 0:
+            raw_direction = -raw_direction
+            alignment = -alignment
+            orthonormal_whitened[:, idx] = -orthonormal_whitened[:, idx]
+        meta_entry = dict(meta_categories[idx])
+        meta_entry["sensitivity"] = float(alignment.item())
+        kept_meta.append(meta_entry)
+        orthogonal_vectors.append(raw_direction)
 
     if not orthogonal_vectors:
-        LOGGER.warning("All semantic directions were filtered out, fallback to %s", fallback_mode)
+        LOGGER.warning("All semantic directions were filtered out after orthonormalisation, fallback to %s", fallback_mode)
         return compute_subspace(model, dataloader, rank=max_rank, mode=fallback_mode, device=device)
 
     basis = torch.stack(orthogonal_vectors, dim=1)
+    meta_categories = kept_meta
     meta = {
-        "method": "category_contrast",
+        "method": "category_polar_alignment",
         "feature_dim": feature_dim,
         "total_samples": total_count,
         "categories": meta_categories,

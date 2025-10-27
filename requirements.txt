@@ -6,3 +6,5 @@ pandas
 tqdm
 scikit-learn
 scipy
+matplotlib
+seaborn

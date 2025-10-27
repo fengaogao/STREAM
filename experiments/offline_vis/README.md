@@ -7,6 +7,7 @@ This folder provides a runnable script that reproduces the two complementary vis
 * **Experiment A – Alignment / Decoupling**
   * Question: do the learned subspace directions align with the annotated content categories, and are the directions mutually decoupled?
   * Output: a direction-vs-category cosine heatmap together with quantitative diagnostics (diagonal energy share, mean signed/absolute diagonal response, maximum & mean cross-response).
+
 * **Experiment B – Controllability / Causality**
   * Question: if we nudge the STREAM state along a category axis, do items of that category receive higher scores/ranks while minimally disturbing others?
   * Output: (1) dose–response curves showing Δlogit / ΔNDCG for the target category vs. others; (2) a top-k recall uplift bar chart for the target category.
@@ -35,7 +36,6 @@ python -m experiments.offline_vis.category_axis_probes \
 ```
 
 The command will create ``experiments/offline_outputs`` with:
-
 * ``experiment_a_heatmap.png`` – direction vs. category cosine map.
 * ``experiment_a_metrics.json`` – alignment metrics (diagonal share, signed/absolute diagonal strength, max/mean cross-response, coverage counts).
 * ``experiment_b_dose_response_Action.png`` – Δlogit / ΔNDCG dose–response curves.

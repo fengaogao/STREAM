@@ -170,6 +170,7 @@ def compute_category_semantic_subspace(
     category_sums: Dict[str, torch.Tensor] = {}
     category_counts: Dict[str, int] = {}
     total_sum: torch.Tensor | None = None
+    total_sq_sum: torch.Tensor | None = None
     total_count = 0
     feature_dim: int | None = None
 
@@ -183,10 +184,12 @@ def compute_category_semantic_subspace(
         if feature_dim is None:
             feature_dim = grads.size(-1)
             total_sum = torch.zeros(feature_dim, device=device)
-        assert total_sum is not None
+            total_sq_sum = torch.zeros(feature_dim, device=device)
+        assert total_sum is not None and total_sq_sum is not None
 
         for grad, target in zip(grads, targets.tolist()):
             total_sum += grad
+            total_sq_sum += grad * grad
             total_count += 1
             if target < 0 or target not in category_map:
                 continue
@@ -200,47 +203,66 @@ def compute_category_semantic_subspace(
                 category_sums[category] += grad
                 category_counts[category] += 1
 
-    if total_count == 0 or feature_dim is None or total_sum is None:
+    if total_count == 0 or feature_dim is None or total_sum is None or total_sq_sum is None:
         LOGGER.warning("No gradients collected, falling back to %s", fallback_mode)
         return compute_subspace(model, dataloader, rank=max_rank, mode=fallback_mode, device=device)
 
     global_mean = total_sum / float(total_count)
+    global_var = total_sq_sum / float(total_count) - global_mean * global_mean
+    global_var = torch.clamp(global_var, min=1e-6)
+    global_std = torch.sqrt(global_var)
 
-    candidate_scores: List[Tuple[str, float]] = []
+    category_contrasts: List[Tuple[str, torch.Tensor, torch.Tensor, int]] = []
     for category, grad_sum in category_sums.items():
         count = category_counts.get(category, 0)
         if count < min_samples_per_category:
             continue
         mean_grad = grad_sum / float(count)
-        contrast = mean_grad - global_mean
-        candidate_scores.append((category, contrast.norm().item()))
+        rest_count = total_count - count
+        if rest_count <= 0:
+            continue
+        rest_mean = (total_sum - grad_sum) / float(rest_count)
+        delta = mean_grad - rest_mean
+        whitened_delta = delta / global_std
+        category_contrasts.append((category, delta, whitened_delta, count))
 
-    candidate_scores.sort(key=lambda x: x[1], reverse=True)
-    selected_categories: List[str] = [cat for cat, _ in candidate_scores[:max_rank]]
-
-    if not selected_categories:
+    if not category_contrasts:
         LOGGER.warning("No category passed the minimum sample threshold, fallback to %s", fallback_mode)
         return compute_subspace(model, dataloader, rank=max_rank, mode=fallback_mode, device=device)
 
+    category_contrasts.sort(key=lambda item: item[2].norm().item(), reverse=True)
+
+    orthogonal_whitened: List[torch.Tensor] = []
     orthogonal_vectors: List[torch.Tensor] = []
     meta_categories: List[Dict] = []
 
-    for category in selected_categories:
-        mean_grad = category_sums[category] / float(category_counts[category])
-        direction = mean_grad - global_mean
-        for existing in orthogonal_vectors:
-            projection = torch.dot(existing, direction) * existing
-            direction = direction - projection
-        norm = direction.norm()
+    for category, delta, whitened_delta, count in category_contrasts:
+        residual = whitened_delta.clone()
+        for existing in orthogonal_whitened:
+            projection = torch.dot(existing, residual)
+            residual = residual - projection * existing
+        norm = residual.norm()
         if norm < 1e-6:
             continue
-        direction = direction / norm
+        residual = residual / norm
+        direction = residual * global_std
+        direction_norm = direction.norm()
+        if direction_norm < 1e-6:
+            continue
+        direction = direction / direction_norm
+        alignment = torch.dot(direction, delta)
+        if alignment < 0:
+            direction = -direction
+            residual = -residual
+            alignment = -alignment
+        orthogonal_whitened.append(residual)
         orthogonal_vectors.append(direction)
         meta_categories.append(
             {
                 "category": category,
-                "count": int(category_counts[category]),
-                "share": float(category_counts[category] / total_count),
+                "count": int(count),
+                "share": float(count / total_count),
+                "sensitivity": float(alignment.item()),
             }
         )
         if len(orthogonal_vectors) >= max_rank:

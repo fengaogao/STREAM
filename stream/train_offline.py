@@ -30,7 +30,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out_dir", type=Path, default="/home/zj/code/STREAM/Yelp/bert")
     parser.add_argument("--model_type", choices=["causal", "bert"], default="bert")
     parser.add_argument("--pretrained_name_or_path", type=str, default="/home/zj/model/Llama-2-7b-hf")
-    parser.add_argument("--rank_r", type=int, default=32)
+    parser.add_argument(
+        "--num_category_directions",
+        type=int,
+        default=0,
+        help="Number of category-aligned directions to keep (0 means use all available)",
+    )
     parser.add_argument("--router_k", type=int, default=16)
     parser.add_argument("--subspace_mode", choices=["gradcov", "pca"], default="gradcov")
     parser.add_argument("--epochs", type=int, default=10)
@@ -156,7 +161,7 @@ def compute_category_semantic_subspace(
     dataloader,
     category_map: Dict[int, List[str]],
     category_order: List[str],
-    max_rank: int,
+    max_categories: int,
     device: torch.device,
     model_type: str,
     fallback_mode: str,
@@ -164,7 +169,7 @@ def compute_category_semantic_subspace(
 ) -> SubspaceResult:
     if not category_order:
         LOGGER.warning("No category metadata detected, falling back to %s", fallback_mode)
-        return compute_subspace(model, dataloader, rank=max_rank, mode=fallback_mode, device=device)
+        return compute_subspace(model, dataloader, rank=max_categories or 1, mode=fallback_mode, device=device)
 
     model.eval()
     category_sums: Dict[str, torch.Tensor] = {}
@@ -176,11 +181,10 @@ def compute_category_semantic_subspace(
 
     for batch in tqdm(dataloader, desc="collect-directions", leave=False):
         batch_device = move_batch_to_device(batch, device)
-        grads = model.stream_positive_gradients(batch_device)
-        targets = extract_targets_from_batch(batch_device, model_type)
-        grads = grads.detach()
-        if grads.device != device:
-            grads = grads.to(device)
+        grads = model.stream_positive_gradients(batch_device)  # [B, D]
+        targets = extract_targets_from_batch(batch_device, model_type)  # [B]
+        grads = grads.detach().to(device)
+
         if feature_dim is None:
             feature_dim = grads.size(-1)
             total_sum = torch.zeros(feature_dim, device=device)
@@ -193,19 +197,19 @@ def compute_category_semantic_subspace(
             total_count += 1
             if target < 0 or target not in category_map:
                 continue
-            categories = category_map[target]
-            if not categories:
+            cats = category_map[target]
+            if not cats:
                 continue
-            for category in categories:
-                if category not in category_sums:
-                    category_sums[category] = torch.zeros_like(grad)
-                    category_counts[category] = 0
-                category_sums[category] += grad
-                category_counts[category] += 1
+            for c in cats:
+                if c not in category_sums:
+                    category_sums[c] = torch.zeros_like(grad)
+                    category_counts[c] = 0
+                category_sums[c] += grad
+                category_counts[c] += 1
 
     if total_count == 0 or feature_dim is None or total_sum is None or total_sq_sum is None:
         LOGGER.warning("No gradients collected, falling back to %s", fallback_mode)
-        return compute_subspace(model, dataloader, rank=max_rank, mode=fallback_mode, device=device)
+        return compute_subspace(model, dataloader, rank=max_categories or 1, mode=fallback_mode, device=device)
 
     global_mean = total_sum / float(total_count)
     global_var = total_sq_sum / float(total_count) - global_mean * global_mean
@@ -213,66 +217,72 @@ def compute_category_semantic_subspace(
     global_std = torch.sqrt(global_var)
 
     category_contrasts: Dict[str, Tuple[torch.Tensor, torch.Tensor, int]] = {}
-    for category, grad_sum in category_sums.items():
-        count = category_counts.get(category, 0)
-        if count < min_samples_per_category:
+    for c, grad_sum in category_sums.items():
+        cnt = category_counts.get(c, 0)
+        if cnt < min_samples_per_category:
             continue
-        mean_grad = grad_sum / float(count)
-        rest_count = total_count - count
-        if rest_count <= 0:
+        mean_grad = grad_sum / float(cnt)
+        rest_cnt = total_count - cnt
+        if rest_cnt <= 0:
             continue
-        rest_mean = (total_sum - grad_sum) / float(rest_count)
+        rest_mean = (total_sum - grad_sum) / float(rest_cnt)
         delta = mean_grad - rest_mean
         whitened_delta = delta / global_std
-        category_contrasts[category] = (delta, whitened_delta, count)
+        category_contrasts[c] = (delta, whitened_delta, cnt)
 
     if not category_contrasts:
         LOGGER.warning("No category passed the minimum sample threshold, fallback to %s", fallback_mode)
-        return compute_subspace(model, dataloader, rank=max_rank, mode=fallback_mode, device=device)
+        return compute_subspace(model, dataloader, rank=max_categories or 1, mode=fallback_mode, device=device)
 
-    # choose categories prioritising user-provided order, falling back to energy ranking
-    energy_map = {cat: category_contrasts[cat][1].norm().item() for cat in category_contrasts}
-    ordered = [cat for cat in category_order if cat in category_contrasts]
-    remaining = [cat for cat in category_contrasts.keys() if cat not in ordered]
-    ordered.extend(sorted(remaining, key=lambda c: energy_map[c], reverse=True))
-    if len(ordered) > max_rank:
-        # keep the most energetic categories when truncating beyond the requested rank
-        ordered = sorted(ordered, key=lambda c: energy_map[c], reverse=True)[:max_rank]
+    energy_map = {c: category_contrasts[c][1].norm().item() for c in category_contrasts}
+    ordered = [c for c in category_order if c in category_contrasts]
+    remaining = [c for c in category_contrasts.keys() if c not in ordered]
+    ordered.extend(sorted(remaining, key=lambda x: energy_map[x], reverse=True))
+    if max_categories > 0 and len(ordered) > max_categories:
+        ordered = sorted(ordered, key=lambda x: energy_map[x], reverse=True)[:max_categories]
 
     whitened_matrix: List[torch.Tensor] = []
     deltas: List[torch.Tensor] = []
     meta_categories: List[Dict] = []
 
-    for category in ordered:
-        delta, whitened_delta, count = category_contrasts[category]
-        whitened_matrix.append(whitened_delta)
+    for c in ordered:
+        delta, wdelta, cnt = category_contrasts[c]
+        whitened_matrix.append(wdelta)
         deltas.append(delta)
         meta_categories.append(
             {
-                "category": category,
-                "count": int(count),
-                "share": float(count / total_count),
-                "energy": float(whitened_delta.norm().item()),
+                "category": c,
+                "count": int(cnt),
+                "share": float(cnt / total_count),
+                "energy": float(wdelta.norm().item()),
             }
         )
 
     if not whitened_matrix:
         LOGGER.warning("Selected categories list is empty after filtering, fallback to %s", fallback_mode)
-        return compute_subspace(model, dataloader, rank=max_rank, mode=fallback_mode, device=device)
+        return compute_subspace(model, dataloader, rank=max_categories or 1, mode=fallback_mode, device=device)
 
-    whitened_stack = torch.stack(whitened_matrix, dim=1)
-    gram = whitened_stack.t() @ whitened_stack
-    eps = 1e-6 * torch.eye(gram.size(0), device=gram.device)
-    gram = gram + eps
-    evals, evecs = torch.linalg.eigh(gram)
-    evals = torch.clamp(evals, min=1e-8)
+    whitened_stack = torch.stack(whitened_matrix, dim=1)  # [D, C]
+    gram = whitened_stack.t() @ whitened_stack            # [C, C]
+    stabiliser = 1e-4 * torch.eye(gram.size(0), device=gram.device)
+    gram = gram + stabiliser
+
+    identity = torch.eye(gram.size(0), device=gram.device)
+    dual_projection = torch.linalg.solve(gram, identity)  # [C, C]
+    clean_alignment = whitened_stack @ dual_projection     # [D, C]
+
+    clean_gram = clean_alignment.t() @ clean_alignment
+    clean_gram = (clean_gram + clean_gram.t()) * 0.5
+    evals, evecs = torch.linalg.eigh(clean_gram)
+    evals = torch.clamp(evals, min=1e-9)
     inv_sqrt = evecs @ torch.diag(evals.rsqrt()) @ evecs.t()
-    orthonormal_whitened = whitened_stack @ inv_sqrt
+    orthonormal_whitened = clean_alignment @ inv_sqrt
 
     orthogonal_vectors: List[torch.Tensor] = []
     kept_meta: List[Dict] = []
     for idx in range(orthonormal_whitened.size(1)):
-        raw_direction = orthonormal_whitened[:, idx] * global_std
+        whitened_vec = orthonormal_whitened[:, idx]
+        raw_direction = whitened_vec * global_std  
         norm = raw_direction.norm()
         if norm < 1e-6:
             continue
@@ -281,23 +291,40 @@ def compute_category_semantic_subspace(
         if alignment < 0:
             raw_direction = -raw_direction
             alignment = -alignment
-            orthonormal_whitened[:, idx] = -orthonormal_whitened[:, idx]
+            whitened_vec = -whitened_vec
+            orthonormal_whitened[:, idx] = whitened_vec
+
+        responses = torch.mv(whitened_stack.t(), whitened_vec)  # [C]
+        responses_list = responses.tolist()
+        response_self = float(responses_list[idx])
+        response_off = [abs(float(r)) for j, r in enumerate(responses_list) if j != idx]
+        max_cross = max(response_off) if response_off else 0.0
+        mean_cross = float(sum(response_off) / len(response_off)) if response_off else 0.0
+
         meta_entry = dict(meta_categories[idx])
         meta_entry["sensitivity"] = float(alignment.item())
+        meta_entry["response_self"] = response_self
+        meta_entry["max_cross_response"] = max_cross
+        meta_entry["mean_cross_response"] = mean_cross
+        meta_entry["dual_weight_norm"] = float(dual_projection[:, idx].norm().item())
+
         kept_meta.append(meta_entry)
         orthogonal_vectors.append(raw_direction)
 
     if not orthogonal_vectors:
         LOGGER.warning("All semantic directions were filtered out after orthonormalisation, fallback to %s", fallback_mode)
-        return compute_subspace(model, dataloader, rank=max_rank, mode=fallback_mode, device=device)
+        return compute_subspace(model, dataloader, rank=max_categories or 1, mode=fallback_mode, device=device)
 
-    basis = torch.stack(orthogonal_vectors, dim=1)
-    meta_categories = kept_meta
+    basis = torch.stack(orthogonal_vectors, dim=1)  # [D, R]
+    category_rank = basis.size(1)
+
     meta = {
-        "method": "category_polar_alignment",
+        "method": "category_dual_projection",
         "feature_dim": feature_dim,
         "total_samples": total_count,
-        "categories": meta_categories,
+        "requested_categories": max_categories,
+        "effective_rank": int(category_rank),
+        "categories": kept_meta,
     }
     return SubspaceResult(basis=basis.detach().cpu(), mode="gradcov", meta=meta)
 
@@ -348,15 +375,17 @@ def main() -> None:
         LOGGER.info("Epoch %d loss %.4f", epoch + 1, loss)
 
     category_map, category_order = load_item_categories(args.data_dir, item_vocab)
+    category_budget = args.num_category_directions
     if args.subspace_mode == "pca":
-        subspace = compute_subspace(model, eval_loader, rank=args.rank_r, mode="pca", device=device)
+        pca_rank = category_budget if category_budget > 0 else 32
+        subspace = compute_subspace(model, eval_loader, rank=pca_rank, mode="pca", device=device)
     else:
         subspace = compute_category_semantic_subspace(
             model=model,
             dataloader=eval_loader,
             category_map=category_map,
             category_order=category_order,
-            max_rank=args.rank_r,
+            max_categories=category_budget,
             device=device,
             model_type=args.model_type,
             fallback_mode="gradcov",

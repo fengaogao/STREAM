@@ -297,7 +297,6 @@ def evaluate_direction_control(
     model_type: str,
     device: torch.device,
     max_batches: Optional[int] = None,
-    direction_meta: Optional[Mapping[str, object]] = None,
 ) -> ControlResult:
     direction_vec = item_head.W[direction_index].detach().to(device)
     direction_vec = direction_vec.clone()
@@ -308,18 +307,10 @@ def evaluate_direction_control(
         if valid_indices:
             mask[torch.tensor(valid_indices, dtype=torch.long, device=device)] = True
         if mask.any() and (~mask).any():
-            target_vals = direction_vec[mask]
-            other_vals = direction_vec[~mask]
-            target_median = target_vals.median()
-            other_median = other_vals.median()
-            center = 0.5 * (target_median + other_median)
-            direction_vec = direction_vec - center
-            target_span = torch.quantile(target_vals, 0.9) - torch.quantile(target_vals, 0.1)
-            other_span = torch.quantile(other_vals, 0.9) - torch.quantile(other_vals, 0.1)
-            pooled_span = torch.sqrt(target_span.clamp_min(1e-6) * other_span.clamp_min(1e-6))
-            separation = (target_median - other_median).abs().clamp_min(1.0)
-            direction_vec = direction_vec / pooled_span.clamp_min(1e-6)
-            direction_vec = direction_vec * separation
+            target_mean = direction_vec[mask].mean()
+            other_mean = direction_vec[~mask].mean()
+            scale = (target_mean - other_mean).abs().clamp_min(1e-6)
+            direction_vec = (direction_vec - other_mean) / scale
         else:
             direction_vec = direction_vec - direction_vec.mean()
             std = direction_vec.std(unbiased=False).clamp_min(1e-6)
@@ -328,15 +319,6 @@ def evaluate_direction_control(
         direction_vec = direction_vec - direction_vec.mean()
         std = direction_vec.std(unbiased=False).clamp_min(1e-6)
         direction_vec = direction_vec / std
-        
-    if direction_meta:
-        sensitivity = abs(float(direction_meta.get("sensitivity", 1.0)))
-        response_self = abs(float(direction_meta.get("response_self", 1.0)))
-        leakage = abs(float(direction_meta.get("mean_cross_response", 0.0)))
-        gain = response_self + sensitivity
-        if leakage > 0.0:
-            gain = gain * (1.0 + min(2.0, response_self / (leakage + 1e-6)))
-        direction_vec = direction_vec * float(max(gain, 1.0))
     topk = sorted({int(k) for k in topk})
     alphas = sorted({float(a) for a in alphas})
     if 0.0 not in alphas:
@@ -523,14 +505,6 @@ def run_experiments(args: argparse.Namespace) -> None:
         )
     direction_index = direction_labels.index(args.target_category)
     topk_values = sorted({int(k) for k in args.topk})
-    direction_meta = None
-    categories_meta = subspace.meta.get("categories") if isinstance(subspace.meta, dict) else None
-    if isinstance(categories_meta, list):
-        for entry in categories_meta:
-            if isinstance(entry, dict) and entry.get("category") == args.target_category:
-                direction_meta = entry
-                break
-
     control = evaluate_direction_control(
         model=model,
         item_head=item_head,
@@ -543,7 +517,6 @@ def run_experiments(args: argparse.Namespace) -> None:
         model_type=args.model_type,
         device=device,
         max_batches=args.evaluation_batches,
-        direction_meta=direction_meta,
     )
     dose_response_path = output_dir / f"experiment_b_dose_response_{args.target_category}.png"
     plot_dose_response(control, args.target_category, dose_response_path)
@@ -593,5 +566,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
 if __name__ == "__main__":
     main()
+
 
 

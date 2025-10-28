@@ -328,7 +328,7 @@ def evaluate_direction_control(
         direction_vec = direction_vec - direction_vec.mean()
         std = direction_vec.std(unbiased=False).clamp_min(1e-6)
         direction_vec = direction_vec / std
-
+        
     if direction_meta:
         sensitivity = abs(float(direction_meta.get("sensitivity", 1.0)))
         response_self = abs(float(direction_meta.get("response_self", 1.0)))

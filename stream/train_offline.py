@@ -376,6 +376,7 @@ def compute_category_semantic_subspace(
         "effective_rank": int(category_rank),
         "categories": kept_meta,
         "category_overlap_shrinkage": float(shrinkage),
+
         "category_overlap_pairs": {
             f"{a}|{b}": float(val) for (a, b), val in overlap_pairs.items()
         },

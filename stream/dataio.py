@@ -97,7 +97,8 @@ class CausalLMDataset(Dataset):
         self.item_vocab = item_vocab
         self.max_history = max_history
         self.max_length = max_length
-        self.samples: List[Dict[str, Sequence[int]]] = []
+        self._sample_specs: List[Tuple[int, List[int], int]] = []
+        self._item_token_id_cache: Dict[int, int] = {}
         self._build(records)
 
     def _build(self, records: Sequence[Dict]) -> None:
@@ -109,39 +110,45 @@ class CausalLMDataset(Dataset):
             for idx in range(1, len(items)):
                 history_items = items[max(0, idx - self.max_history) : idx]
                 target_item = items[idx]
-                history_tokens = [self.item_vocab.token_for(i) for i in history_items]
-                prompt = "User {} History: {} Next?".format(
-                    user,
-                    " ; ".join(history_tokens) if history_tokens else "<none>",
-                )
-                encoded = self.tokenizer(
-                    prompt,
-                    add_special_tokens=True,
-                    truncation=True,
-                    max_length=self.max_length - 1,
-                )
-                target_token_id = self.tokenizer.convert_tokens_to_ids(
-                    self.item_vocab.token_for(target_item)
-                )
-                if target_token_id is None or target_token_id < 0:
-                    raise ValueError("Tokenizer missing target item token")
-                input_ids = encoded["input_ids"] + [target_token_id]
-                attention_mask = encoded["attention_mask"] + [1]
-                labels = [-100] * len(encoded["input_ids"]) + [target_token_id]
-                self.samples.append(
-                    {
-                        "input_ids": input_ids,
-                        "attention_mask": attention_mask,
-                        "labels": labels,
-                        "target_item": target_item,
-                    }
-                )
+                self._sample_specs.append((user, history_items, target_item))
+
+    def _token_id_for_item(self, item_idx: int) -> int:
+        token_id = self._item_token_id_cache.get(item_idx)
+        if token_id is not None:
+            return token_id
+        token = self.item_vocab.token_for(item_idx)
+        token_id = self.tokenizer.convert_tokens_to_ids(token)
+        if token_id is None or token_id < 0:
+            raise ValueError("Tokenizer missing target item token")
+        self._item_token_id_cache[item_idx] = token_id
+        return token_id
 
     def __len__(self) -> int:  # type: ignore[override]
-        return len(self.samples)
+        return len(self._sample_specs)
 
     def __getitem__(self, idx: int) -> Dict[str, Sequence[int]]:  # type: ignore[override]
-        return self.samples[idx]
+        user, history_items, target_item = self._sample_specs[idx]
+        history_tokens = [self.item_vocab.token_for(i) for i in history_items]
+        prompt = "User {} History: {} Next?".format(
+            user,
+            " ; ".join(history_tokens) if history_tokens else "<none>",
+        )
+        encoded = self.tokenizer(
+            prompt,
+            add_special_tokens=True,
+            truncation=True,
+            max_length=self.max_length - 1,
+        )
+        target_token_id = self._token_id_for_item(target_item)
+        input_ids = encoded["input_ids"] + [target_token_id]
+        attention_mask = encoded["attention_mask"] + [1]
+        labels = [-100] * len(encoded["input_ids"]) + [target_token_id]
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+            "target_item": target_item,
+        }
 
 
 def _pad_sequences(seqs: List[Sequence[int]], pad_value: int) -> torch.Tensor:

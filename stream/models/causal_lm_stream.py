@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 from typing import Dict
+import warnings
 
 import torch
 from torch import nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
 from stream.dataio import ItemVocab, ensure_tokenizer_has_items
 from stream.models import BaseStreamModel
+
 
 def _init_item_token_from_text(
     model,
@@ -31,17 +34,20 @@ def _init_item_token_from_text(
 
 
 class CausalLMStreamModel(BaseStreamModel):
-    def __init__(self,
+    def __init__(
+        self,
         pretrained_name_or_path: str,
         item_vocab: ItemVocab,
         device: torch.device,
         tokenizer_name_or_path: str | None = None,
-        torch_dtype: torch.dtype | None = torch.float16,
-        device_map: str | None = "auto",
+        dtype: torch.dtype | None = torch.float16,
+        *,
+        torch_dtype: torch.dtype | None = None,
+        device_map: str | dict | None = None,
         item_name_map: dict[int, str] | None = None,
     ) -> None:
         super().__init__()
-        self.device = device
+        self.device = device if device_map is None else None
 
         tokenizer_source = tokenizer_name_or_path or pretrained_name_or_path
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=True)
@@ -50,15 +56,27 @@ class CausalLMStreamModel(BaseStreamModel):
         # 尝试使用 flash-attn；不可用则自动忽略该参数
         model_kwargs = {}
         if torch_dtype is not None:
-            model_kwargs["torch_dtype"] = torch_dtype
+            warnings.warn(
+                "`torch_dtype` is deprecated, please pass `dtype` instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if dtype is None:
+                dtype = torch_dtype
+        if dtype is not None:
+            model_kwargs["dtype"] = dtype
         if device_map is not None:
             model_kwargs["device_map"] = device_map
 
         self.model = AutoModelForCausalLM.from_pretrained(
             pretrained_name_or_path,
-            **model_kwargs
+            **model_kwargs,
         )
         self.model.resize_token_embeddings(len(self.tokenizer))
+
+        self.item_vocab = item_vocab
+        self.num_items = item_vocab.num_items
+
         if item_name_map:
             for i in range(self.num_items):
                 tok = item_vocab.token_for(i)
@@ -66,13 +84,12 @@ class CausalLMStreamModel(BaseStreamModel):
                 if name_txt:
                     _init_item_token_from_text(self.model, self.tokenizer, tok, name_txt)
 
-        self.model.to(device if device_map is None else self.model.device)
+        if device_map is None:
+            self.model.to(device)
 
-        self.item_vocab = item_vocab
-        self.num_items = item_vocab.num_items
         self.item_token_ids = torch.tensor(
             [self.tokenizer.convert_tokens_to_ids(item_vocab.token_for(i)) for i in range(self.num_items)],
-            device=(device if device_map is None else self.model.device),
+            device=self.model.lm_head.weight.device,
             dtype=torch.long,
         )
         if self.tokenizer.pad_token_id is None:
@@ -81,10 +98,17 @@ class CausalLMStreamModel(BaseStreamModel):
         self.lm_head_weight: nn.Parameter = self.model.lm_head.weight  # type: ignore[attr-defined]
 
     def _last_hidden(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        inputs = {k: v.to(self.device) for k, v in batch.items() if k in {"input_ids", "attention_mask"}}
+        inputs = {}
+        for key in ("input_ids", "attention_mask"):
+            if key in batch:
+                tensor = batch[key]
+                if self.device is not None:
+                    tensor = tensor.to(self.device)
+                inputs[key] = tensor
         outputs = self.model(**inputs, output_hidden_states=True)
         hidden = outputs.hidden_states[-1]
-        lengths = inputs["attention_mask"].sum(dim=1) - 1
+        attention_mask = inputs["attention_mask"]
+        lengths = attention_mask.sum(dim=1).to(hidden.device) - 1
         batch_indices = torch.arange(hidden.size(0), device=hidden.device)
         last_hidden = hidden[batch_indices, lengths]
         return last_hidden

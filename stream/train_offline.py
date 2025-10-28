@@ -43,6 +43,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument(
+        "--dataloader_workers",
+        type=int,
+        default=4,
+        help="Number of DataLoader worker processes (set 0 to disable multiprocessing)",
+    )
     return parser.parse_args()
 
 
@@ -371,6 +377,7 @@ def main() -> None:
         shuffle=True,
         item_vocab=item_vocab,
         tokenizer=tokenizer,
+        num_workers=args.dataloader_workers,
     )
     _, eval_loader = build_dataloader(
         splits["original"],
@@ -379,6 +386,7 @@ def main() -> None:
         shuffle=False,
         item_vocab=item_vocab,
         tokenizer=tokenizer,
+        num_workers=args.dataloader_workers,
     )
 
     optimizer = AdamW(model.parameters(), lr=args.lr)

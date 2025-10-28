@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import pickle
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -173,11 +173,13 @@ def compute_category_semantic_subspace(
 
     model.eval()
     category_sums: Dict[str, torch.Tensor] = {}
-    category_counts: Dict[str, int] = {}
+    category_counts: Dict[str, float] = {}
     total_sum: torch.Tensor | None = None
     total_sq_sum: torch.Tensor | None = None
     total_count = 0
     feature_dim: int | None = None
+
+    overlap_pairs: dict[tuple[str, str], float] = defaultdict(float)
 
     for batch in tqdm(dataloader, desc="collect-directions", leave=False):
         batch_device = move_batch_to_device(batch, device)
@@ -200,12 +202,18 @@ def compute_category_semantic_subspace(
             cats = category_map[target]
             if not cats:
                 continue
+            weight = 1.0 / float(len(cats))
             for c in cats:
                 if c not in category_sums:
                     category_sums[c] = torch.zeros_like(grad)
-                    category_counts[c] = 0
-                category_sums[c] += grad
-                category_counts[c] += 1
+                    category_counts[c] = 0.0
+                category_sums[c] += grad * weight
+                category_counts[c] += weight
+            if len(cats) > 1:
+                for i, ci in enumerate(cats):
+                    for cj in cats[i + 1 :]:
+                        key = tuple(sorted((ci, cj)))
+                        overlap_pairs[key] += weight * weight
 
     if total_count == 0 or feature_dim is None or total_sum is None or total_sq_sum is None:
         LOGGER.warning("No gradients collected, falling back to %s", fallback_mode)
@@ -216,9 +224,9 @@ def compute_category_semantic_subspace(
     global_var = torch.clamp(global_var, min=1e-6)
     global_std = torch.sqrt(global_var)
 
-    category_contrasts: Dict[str, Tuple[torch.Tensor, torch.Tensor, int]] = {}
+    category_contrasts: Dict[str, Tuple[torch.Tensor, torch.Tensor, float]] = {}
     for c, grad_sum in category_sums.items():
-        cnt = category_counts.get(c, 0)
+        cnt = float(category_counts.get(c, 0.0))
         if cnt < min_samples_per_category:
             continue
         mean_grad = grad_sum / float(cnt)
@@ -262,10 +270,50 @@ def compute_category_semantic_subspace(
         LOGGER.warning("Selected categories list is empty after filtering, fallback to %s", fallback_mode)
         return compute_subspace(model, dataloader, rank=max_categories or 1, mode=fallback_mode, device=device)
 
+    count_tensor = torch.tensor([float(category_counts[c]) for c in ordered], device=device)
+    balance = count_tensor.sqrt().clamp_min(1.0)
+
     whitened_stack = torch.stack(whitened_matrix, dim=1)  # [D, C]
+    whitened_stack = whitened_stack / balance.unsqueeze(0)
     gram = whitened_stack.t() @ whitened_stack            # [C, C]
-    stabiliser = 1e-4 * torch.eye(gram.size(0), device=gram.device)
+    stabiliser = 5e-4 * torch.eye(gram.size(0), device=gram.device)
     gram = gram + stabiliser
+    shrinkage = 0.0
+    if gram.size(0) > 1:
+        diag = torch.diagonal(gram)
+        diag_matrix = torch.diag_embed(diag)
+        off_diag = gram - diag_matrix
+        mean_diag = float(torch.clamp(diag.abs().mean(), min=1e-8).item())
+        mean_off = float(off_diag.abs().mean().item())
+        pair_overlap = torch.zeros_like(gram)
+        for i, ci in enumerate(ordered):
+            for j, cj in enumerate(ordered):
+                if i == j:
+                    continue
+                key = (ci, cj) if ci <= cj else (cj, ci)
+                overlap_val = overlap_pairs.get(key, 0.0)
+                if overlap_val > 0.0:
+                    pair_overlap[i, j] = overlap_val
+        if mean_off > 0.0:
+            base_shrink = min(0.45, (mean_off / mean_diag) ** 0.5)
+            diag_counts = count_tensor.clamp_min(1e-6)
+            denom = torch.minimum(diag_counts.unsqueeze(0), diag_counts.unsqueeze(1))
+            denom = denom.clamp_min(1e-6)
+            overlap_ratio = pair_overlap / denom
+            overlap_ratio.fill_diagonal_(0.0)
+            if overlap_ratio.numel() > 0:
+                ratio_max = float(overlap_ratio.max().item())
+            else:
+                ratio_max = 0.0
+            if ratio_max > 0.0:
+                adaptive = torch.clamp(overlap_ratio / ratio_max, min=0.0, max=1.0)
+            else:
+                adaptive = torch.zeros_like(overlap_ratio)
+            shrink_map = base_shrink + 0.5 * adaptive
+            shrink_map = torch.clamp(shrink_map, 0.0, 0.95)
+            adjusted_off = off_diag * (1.0 - shrink_map)
+            gram = diag_matrix + adjusted_off
+            shrinkage = float(shrink_map.max().item()) if shrink_map.numel() else 0.0
 
     identity = torch.eye(gram.size(0), device=gram.device)
     dual_projection = torch.linalg.solve(gram, identity)  # [C, C]
@@ -307,6 +355,8 @@ def compute_category_semantic_subspace(
         meta_entry["max_cross_response"] = max_cross
         meta_entry["mean_cross_response"] = mean_cross
         meta_entry["dual_weight_norm"] = float(dual_projection[:, idx].norm().item())
+        meta_entry["balanced_energy"] = float((whitened_stack[:, idx]).norm().item())
+        meta_entry["count_balance"] = float(balance[idx].item())
 
         kept_meta.append(meta_entry)
         orthogonal_vectors.append(raw_direction)
@@ -325,6 +375,10 @@ def compute_category_semantic_subspace(
         "requested_categories": max_categories,
         "effective_rank": int(category_rank),
         "categories": kept_meta,
+        "category_overlap_shrinkage": float(shrinkage),
+        "category_overlap_pairs": {
+            f"{a}|{b}": float(val) for (a, b), val in overlap_pairs.items()
+        },
     }
     return SubspaceResult(basis=basis.detach().cpu(), mode="gradcov", meta=meta)
 

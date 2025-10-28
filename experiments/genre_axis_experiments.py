@@ -117,11 +117,11 @@ def collect_category_gradients(
     device: torch.device,
     max_batches: Optional[int] = None,
     min_samples: int = 20,
-) -> Tuple[Dict[str, torch.Tensor], Dict[str, int]]:
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, float]]:
     """Aggregate whitened category gradients aligned with the training objective."""
 
     category_sums: Dict[str, torch.Tensor] = {}
-    counts: Dict[str, int] = {}
+    counts: Dict[str, float] = {}
     processed = 0
     feature_dim: Optional[int] = None
     total_sum: Optional[torch.Tensor] = None
@@ -152,12 +152,13 @@ def collect_category_gradients(
             categories = category_map.get(int(target_idx), [])
             if not categories:
                 continue
+            weight = 1.0 / float(len(categories))
             for category in categories:
                 if category not in category_sums:
                     category_sums[category] = torch.zeros_like(grad)
-                    counts[category] = 0
-                category_sums[category] += grad
-                counts[category] += 1
+                    counts[category] = 0.0
+                category_sums[category] += grad * weight
+                counts[category] += weight
         processed += 1
         if max_batches is not None and processed >= max_batches:
             break
@@ -173,7 +174,7 @@ def collect_category_gradients(
     # build whitened category deltas: E[g|c] - E[g|~c], then / std
     category_deltas: Dict[str, torch.Tensor] = {}
     for category, total in category_sums.items():
-        cnt = counts[category]
+        cnt = float(counts[category])
         if cnt < max(min_samples, 1):
             continue
         mean_grad = total / float(cnt)
@@ -298,6 +299,26 @@ def evaluate_direction_control(
     max_batches: Optional[int] = None,
 ) -> ControlResult:
     direction_vec = item_head.W[direction_index].detach().to(device)
+    direction_vec = direction_vec.clone()
+    target_item_indices = [idx for idx, cats in category_lookup.items() if target_category in cats]
+    if target_item_indices:
+        mask = torch.zeros(direction_vec.size(0), dtype=torch.bool, device=device)
+        valid_indices = [idx for idx in target_item_indices if 0 <= idx < direction_vec.size(0)]
+        if valid_indices:
+            mask[torch.tensor(valid_indices, dtype=torch.long, device=device)] = True
+        if mask.any() and (~mask).any():
+            target_mean = direction_vec[mask].mean()
+            other_mean = direction_vec[~mask].mean()
+            scale = (target_mean - other_mean).abs().clamp_min(1e-6)
+            direction_vec = (direction_vec - other_mean) / scale
+        else:
+            direction_vec = direction_vec - direction_vec.mean()
+            std = direction_vec.std(unbiased=False).clamp_min(1e-6)
+            direction_vec = direction_vec / std
+    else:
+        direction_vec = direction_vec - direction_vec.mean()
+        std = direction_vec.std(unbiased=False).clamp_min(1e-6)
+        direction_vec = direction_vec / std
     topk = sorted({int(k) for k in topk})
     alphas = sorted({float(a) for a in alphas})
     if 0.0 not in alphas:

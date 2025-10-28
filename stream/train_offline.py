@@ -173,7 +173,7 @@ def compute_category_semantic_subspace(
 
     model.eval()
     category_sums: Dict[str, torch.Tensor] = {}
-    category_counts: Dict[str, int] = {}
+    category_counts: Dict[str, float] = {}
     total_sum: torch.Tensor | None = None
     total_sq_sum: torch.Tensor | None = None
     total_count = 0
@@ -200,12 +200,13 @@ def compute_category_semantic_subspace(
             cats = category_map[target]
             if not cats:
                 continue
+            weight = 1.0 / float(len(cats))
             for c in cats:
                 if c not in category_sums:
                     category_sums[c] = torch.zeros_like(grad)
-                    category_counts[c] = 0
-                category_sums[c] += grad
-                category_counts[c] += 1
+                    category_counts[c] = 0.0
+                category_sums[c] += grad * weight
+                category_counts[c] += weight
 
     if total_count == 0 or feature_dim is None or total_sum is None or total_sq_sum is None:
         LOGGER.warning("No gradients collected, falling back to %s", fallback_mode)
@@ -216,9 +217,9 @@ def compute_category_semantic_subspace(
     global_var = torch.clamp(global_var, min=1e-6)
     global_std = torch.sqrt(global_var)
 
-    category_contrasts: Dict[str, Tuple[torch.Tensor, torch.Tensor, int]] = {}
+    category_contrasts: Dict[str, Tuple[torch.Tensor, torch.Tensor, float]] = {}
     for c, grad_sum in category_sums.items():
-        cnt = category_counts.get(c, 0)
+        cnt = float(category_counts.get(c, 0.0))
         if cnt < min_samples_per_category:
             continue
         mean_grad = grad_sum / float(cnt)
@@ -266,6 +267,16 @@ def compute_category_semantic_subspace(
     gram = whitened_stack.t() @ whitened_stack            # [C, C]
     stabiliser = 1e-4 * torch.eye(gram.size(0), device=gram.device)
     gram = gram + stabiliser
+    shrinkage = 0.0
+    if gram.size(0) > 1:
+        diag = torch.diagonal(gram)
+        diag_matrix = torch.diag_embed(diag)
+        off_diag = gram - diag_matrix
+        mean_diag = float(torch.clamp(diag.abs().mean(), min=1e-8).item())
+        mean_off = float(off_diag.abs().mean().item())
+        if mean_off > 0.0:
+            shrinkage = min(0.5, mean_off / mean_diag)
+            gram = (1.0 - shrinkage) * gram + shrinkage * diag_matrix
 
     identity = torch.eye(gram.size(0), device=gram.device)
     dual_projection = torch.linalg.solve(gram, identity)  # [C, C]
@@ -325,6 +336,7 @@ def compute_category_semantic_subspace(
         "requested_categories": max_categories,
         "effective_rank": int(category_rank),
         "categories": kept_meta,
+        "category_overlap_shrinkage": float(shrinkage),
     }
     return SubspaceResult(basis=basis.detach().cpu(), mode="gradcov", meta=meta)
 

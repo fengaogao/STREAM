@@ -506,6 +506,7 @@ def main() -> None:
                 device_ids=[device.index] if device.type == "cuda" else None,
                 output_device=device.index if device.type == "cuda" else None,
                 broadcast_buffers=False,
+                find_unused_parameters=True,
             )
             backbone = _get_causal_backbone(model)
             if hasattr(backbone, "lm_head"):

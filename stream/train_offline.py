@@ -6,6 +6,7 @@ import json
 import os
 import pickle
 from collections import Counter
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -46,6 +47,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--subspace_mode", choices=["gradcov", "pca"], default="gradcov")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument(
+        "--grad_accumulation_steps",
+        type=int,
+        default=1,
+        help="Number of micro-batches to accumulate before each optimizer step",
+    )
+    parser.add_argument(
+        "--max_grad_norm",
+        type=float,
+        default=1.0,
+        help="Gradient clipping value (set <=0 to disable)",
+    )
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--device", type=str, default="cuda")
@@ -69,6 +82,48 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=4,
         help="Number of DataLoader worker processes (set 0 to disable multiprocessing)",
+    )
+    parser.add_argument(
+        "--pin_memory",
+        action="store_true",
+        help="Enable pinned host memory for DataLoader workers",
+    )
+    parser.add_argument(
+        "--persistent_workers",
+        action="store_true",
+        help="Keep DataLoader workers alive between epochs (requires num_workers > 0)",
+    )
+    parser.add_argument(
+        "--prefetch_factor",
+        type=int,
+        default=None,
+        help="Number of samples to prefetch per worker (requires num_workers > 0)",
+    )
+    parser.add_argument(
+        "--pretokenize",
+        action="store_true",
+        help="Pre-tokenise the training split into an in-memory cache (may require substantial RAM)",
+    )
+    parser.add_argument(
+        "--token_cache_dir",
+        type=Path,
+        default=None,
+        help="Optional directory for cached tokenised samples",
+    )
+    parser.add_argument(
+        "--token_cache_overwrite",
+        action="store_true",
+        help="Rebuild any existing token cache on disk",
+    )
+    parser.add_argument(
+        "--materialize_token_cache",
+        action="store_true",
+        help="Eagerly precompute tokenised samples to disk before training starts",
+    )
+    parser.add_argument(
+        "--disable_ddp_no_sync",
+        action="store_true",
+        help="Force gradient synchronisation on every micro-batch even when accumulating",
     )
     return parser.parse_args()
 
@@ -127,38 +182,55 @@ def train_epoch(
     *,
     is_main_process: bool,
     distributed: bool,
+    grad_accumulation_steps: int,
+    max_grad_norm: float,
+    enable_no_sync: bool,
 ) -> float:
     model.train()
+    grad_accumulation_steps = max(grad_accumulation_steps, 1)
+    if model_type not in {"causal", "bert"}:
+        raise ValueError(f"Unsupported model_type {model_type}")
     total_loss = 0.0
-    steps = 0
+    micro_steps = 0
+    ddp_module = getattr(model, "model", None)
+    use_no_sync = (
+        distributed
+        and enable_no_sync
+        and grad_accumulation_steps > 1
+        and hasattr(ddp_module, "no_sync")
+    )
     progress = tqdm(dataloader, desc="train", leave=False, disable=not is_main_process)
-    for batch in progress:
-        optimizer.zero_grad()
-        if model_type == "causal":
+    optimizer.zero_grad()
+    for step, batch in enumerate(progress, start=1):
+        context = ddp_module.no_sync if (use_no_sync and step % grad_accumulation_steps != 0) else nullcontext
+        with context():
+            batch_on_device = move_batch_to_device(batch, device)
             inputs = {
-                "input_ids": batch["input_ids"].to(device),
-                "attention_mask": batch["attention_mask"].to(device),
-                "labels": batch["labels"].to(device),
+                "input_ids": batch_on_device["input_ids"],
+                "attention_mask": batch_on_device["attention_mask"],
+                "labels": batch_on_device["labels"],
             }
             outputs = model.model(**inputs)
-        else:
-            inputs = {
-                "input_ids": batch["input_ids"].to(device),
-                "attention_mask": batch["attention_mask"].to(device),
-                "labels": batch["labels"].to(device),
-            }
-            outputs = model.model(**inputs)
-        loss = outputs.loss
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+            loss = outputs.loss
+            (loss / grad_accumulation_steps).backward()
         total_loss += float(loss.item())
-        steps += 1
-    metrics = torch.tensor([total_loss, float(steps)], device=device)
+        micro_steps += 1
+        if step % grad_accumulation_steps == 0:
+            if max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+            optimizer.step()
+            optimizer.zero_grad()
+    remainder = micro_steps % grad_accumulation_steps
+    if remainder != 0:
+        if max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+        optimizer.step()
+        optimizer.zero_grad()
+    metrics = torch.tensor([total_loss, float(micro_steps)], device=device)
     if distributed:
         dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
-    total_loss, steps = metrics.tolist()
-    return total_loss / max(int(steps), 1)
+    total_loss, micro_steps = metrics.tolist()
+    return total_loss / max(int(micro_steps), 1)
 
 
 def build_router(model, dataloader, router_k: int, device) -> Dict:
@@ -453,6 +525,16 @@ def main() -> None:
     world_size = 1
     local_rank = 0
 
+    if args.grad_accumulation_steps < 1:
+        raise ValueError("--grad_accumulation_steps must be >= 1")
+    if args.persistent_workers and args.dataloader_workers == 0:
+        LOGGER.warning("persistent_workers requested but num_workers=0; disabling persistent workers")
+        args.persistent_workers = False
+    effective_prefetch = args.prefetch_factor
+    if effective_prefetch is not None and args.dataloader_workers == 0:
+        LOGGER.warning("prefetch_factor requires num_workers > 0; ignoring prefetch request")
+        effective_prefetch = None
+
     default_device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if args.model_type == "causal" and dist.is_available():
@@ -567,6 +649,8 @@ def main() -> None:
         tokenizer = None
         trainable_params = list(model.parameters())
 
+    cache_materialise_rank = args.materialize_token_cache and (not distributed or is_main_process)
+
     train_dataset, train_loader = build_dataloader(
         splits["original"],
         model_type=args.model_type,
@@ -576,6 +660,14 @@ def main() -> None:
         tokenizer=tokenizer,
         num_workers=args.dataloader_workers,
         item_text_map=item_text_map if args.model_type == "causal" else None,
+        pretokenize=args.pretokenize,
+        token_cache_dir=args.token_cache_dir,
+        cache_overwrite=args.token_cache_overwrite,
+        materialize_cache=cache_materialise_rank,
+        show_cache_progress=is_main_process and (args.pretokenize or cache_materialise_rank),
+        pin_memory=args.pin_memory,
+        persistent_workers=args.persistent_workers,
+        prefetch_factor=effective_prefetch,
     )
     _, eval_loader = build_dataloader(
         splits["original"],
@@ -586,7 +678,15 @@ def main() -> None:
         tokenizer=tokenizer,
         num_workers=args.dataloader_workers,
         item_text_map=item_text_map if args.model_type == "causal" else None,
+        token_cache_dir=args.token_cache_dir,
+        cache_overwrite=args.token_cache_overwrite,
+        pin_memory=args.pin_memory,
+        persistent_workers=args.persistent_workers,
+        prefetch_factor=effective_prefetch,
     )
+
+    if distributed and args.materialize_token_cache and dist.is_initialized():
+        dist.barrier()
 
     train_sampler: DistributedSampler | None = None
     if args.model_type == "causal" and distributed:
@@ -596,14 +696,20 @@ def main() -> None:
             rank=rank,
             shuffle=True,
         )
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            sampler=train_sampler,
-            num_workers=args.dataloader_workers,
-            collate_fn=train_loader.collate_fn,
-        )
+        loader_kwargs = {
+            "dataset": train_dataset,
+            "batch_size": args.batch_size,
+            "shuffle": False,
+            "sampler": train_sampler,
+            "num_workers": args.dataloader_workers,
+            "collate_fn": train_loader.collate_fn,
+            "pin_memory": args.pin_memory,
+        }
+        if args.dataloader_workers > 0:
+            loader_kwargs["persistent_workers"] = args.persistent_workers
+            if effective_prefetch is not None:
+                loader_kwargs["prefetch_factor"] = effective_prefetch
+        train_loader = DataLoader(**loader_kwargs)
 
     if args.model_type == "causal":
         if trainable_params is None:
@@ -622,6 +728,9 @@ def main() -> None:
             args.model_type,
             is_main_process=is_main_process,
             distributed=distributed,
+            grad_accumulation_steps=args.grad_accumulation_steps,
+            max_grad_norm=args.max_grad_norm,
+            enable_no_sync=not args.disable_ddp_no_sync,
         )
         if is_main_process:
             LOGGER.info("Epoch %d loss %.4f", epoch + 1, loss)

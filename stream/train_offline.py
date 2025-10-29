@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pickle
 from collections import Counter
 from pathlib import Path
@@ -20,6 +21,8 @@ from stream.models.bert_stream import BertStreamModel
 from stream.state_adapter import ItemHead, ItemHeadInit
 from stream.subspace import SubspaceResult, compute_subspace
 from stream.utils import get_logger, set_seed
+
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 LOGGER = get_logger(__name__)
 
@@ -65,6 +68,49 @@ def parse_args() -> argparse.Namespace:
         help="Number of DataLoader worker processes (set 0 to disable multiprocessing)",
     )
     return parser.parse_args()
+
+
+def _mask_parameter_rows(
+    parameter: torch.nn.Parameter,
+    row_indices: torch.Tensor,
+    component_name: str,
+) -> None:
+    """Restrict gradients to the specified token rows for a parameter matrix."""
+
+    if row_indices.numel() == 0:
+        LOGGER.warning("No item token ids provided for %s; skipping fine-tuning", component_name)
+        return
+
+    with torch.no_grad():
+        unique_ids = torch.unique(row_indices.detach().long())
+        valid = unique_ids[(unique_ids >= 0) & (unique_ids < parameter.size(0))]
+    if valid.numel() == 0:
+        LOGGER.warning("No valid item token ids found for %s; skipping fine-tuning", component_name)
+        return
+
+    mask = torch.zeros(parameter.size(0), dtype=torch.bool, device=parameter.device)
+    mask[valid] = True
+    view_shape = (parameter.size(0),) + (1,) * (parameter.dim() - 1)
+    mask = mask.view(view_shape)
+
+    def _hook(grad: torch.Tensor) -> torch.Tensor:
+        return grad * mask.to(grad.device, dtype=grad.dtype)
+
+    parameter.requires_grad_(True)
+    parameter.register_hook(_hook)
+    LOGGER.info(
+        "Unfreezing %s for %d item-specific rows (out of %d total)",
+        component_name,
+        int(valid.numel()),
+        parameter.size(0),
+    )
+
+
+def _get_causal_backbone(model: CausalLMStreamModel):
+    backbone = model.model
+    if isinstance(backbone, torch.nn.DataParallel):
+        backbone = backbone.module
+    return backbone
 
 
 def train_epoch(model, dataloader, optimizer, device, model_type: str) -> float:
@@ -403,6 +449,17 @@ def main() -> None:
             tokenizer_name_or_path=None,
             item_name_map=item_text_map,
         )
+        if device.type == "cuda" and torch.cuda.device_count() > 1:
+            LOGGER.info(
+                "Wrapping causal LM backbone with DataParallel across %d GPUs",
+                torch.cuda.device_count(),
+            )
+            model.model = torch.nn.DataParallel(model.model)
+            model.model.to(device)
+            # Ensure downstream components read from the primary module weights
+            backbone = _get_causal_backbone(model)
+            if hasattr(backbone, "lm_head"):
+                model.lm_head_weight = backbone.lm_head.weight  # type: ignore[attr-defined]
         tokenizer = model.tokenizer
     else:
         model = BertStreamModel(item_vocab, device)
@@ -442,25 +499,26 @@ def main() -> None:
             trainable_set = {}
             trainable_params = []
             trained_components = []
+            backbone = _get_causal_backbone(model)
 
             if not args.freeze_item_embeddings:
-                input_embeddings = model.model.get_input_embeddings()
+                input_embeddings = backbone.get_input_embeddings()
                 if input_embeddings is not None:
                     weight = input_embeddings.weight
-                    weight.requires_grad_(True)
+                    _mask_parameter_rows(weight, model.item_token_ids, "item token embeddings")
                     if id(weight) not in trainable_set:
                         trainable_set[id(weight)] = weight
                         trainable_params.append(weight)
-                        trained_components.append("item-embeddings")
+                        trained_components.append("item-embeddings(<item_i>)")
             if not args.freeze_lm_head:
-                lm_head = getattr(model.model, "lm_head", None)
+                lm_head = getattr(backbone, "lm_head", None)
                 if lm_head is not None:
                     for param in lm_head.parameters():
-                        param.requires_grad_(True)
+                        _mask_parameter_rows(param, model.item_token_ids, "LM head rows")
                         if id(param) not in trainable_set:
                             trainable_set[id(param)] = param
                             trainable_params.append(param)
-                    trained_components.append("lm-head")
+                    trained_components.append("lm-head(<item_i>)")
 
             if not trainable_params:
                 raise ValueError(

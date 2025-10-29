@@ -10,8 +10,11 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 import torch
+import torch.distributed as dist
 from sklearn.cluster import KMeans
 from torch.optim import AdamW
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from stream.config import StreamConfig
@@ -110,14 +113,26 @@ def _get_causal_backbone(model: CausalLMStreamModel):
     backbone = model.model
     if isinstance(backbone, torch.nn.DataParallel):
         backbone = backbone.module
+    if isinstance(backbone, torch.nn.parallel.DistributedDataParallel):
+        backbone = backbone.module
     return backbone
 
 
-def train_epoch(model, dataloader, optimizer, device, model_type: str) -> float:
+def train_epoch(
+    model,
+    dataloader,
+    optimizer,
+    device,
+    model_type: str,
+    *,
+    is_main_process: bool,
+    distributed: bool,
+) -> float:
     model.train()
     total_loss = 0.0
     steps = 0
-    for batch in tqdm(dataloader, desc="train", leave=False):
+    progress = tqdm(dataloader, desc="train", leave=False, disable=not is_main_process)
+    for batch in progress:
         optimizer.zero_grad()
         if model_type == "causal":
             inputs = {
@@ -139,7 +154,11 @@ def train_epoch(model, dataloader, optimizer, device, model_type: str) -> float:
         optimizer.step()
         total_loss += float(loss.item())
         steps += 1
-    return total_loss / max(steps, 1)
+    metrics = torch.tensor([total_loss, float(steps)], device=device)
+    if distributed:
+        dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
+    total_loss, steps = metrics.tolist()
+    return total_loss / max(int(steps), 1)
 
 
 def build_router(model, dataloader, router_k: int, device) -> Dict:
@@ -429,8 +448,34 @@ def compute_category_semantic_subspace(
 
 def main() -> None:
     args = parse_args()
-    device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    set_seed(args.seed)
+    distributed = False
+    rank = 0
+    world_size = 1
+    local_rank = 0
+
+    default_device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if args.model_type == "causal" and dist.is_available():
+        world_size_env = int(os.environ.get("WORLD_SIZE", "1"))
+        if world_size_env > 1:
+            backend = "nccl" if torch.cuda.is_available() else "gloo"
+            dist.init_process_group(backend=backend)
+            distributed = True
+            world_size = dist.get_world_size()
+            rank = dist.get_rank()
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            if torch.cuda.is_available():
+                torch.cuda.set_device(local_rank)
+                device = torch.device("cuda", local_rank)
+            else:
+                device = torch.device("cpu")
+        else:
+            device = default_device
+    else:
+        device = default_device
+
+    is_main_process = rank == 0
+    set_seed(args.seed + rank if distributed else args.seed)
 
     out_dir = args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -449,14 +494,19 @@ def main() -> None:
             tokenizer_name_or_path=None,
             item_name_map=item_text_map,
         )
-        if device.type == "cuda" and torch.cuda.device_count() > 1:
+        if distributed:
             LOGGER.info(
-                "Wrapping causal LM backbone with DataParallel across %d GPUs",
-                torch.cuda.device_count(),
+                "Initialising DistributedDataParallel for causal LM on rank %d/%d (local rank %d)",
+                rank,
+                world_size,
+                local_rank,
             )
-            model.model = torch.nn.DataParallel(model.model)
-            model.model.to(device)
-            # Ensure downstream components read from the primary module weights
+            model.model = torch.nn.parallel.DistributedDataParallel(
+                model.model,
+                device_ids=[device.index] if device.type == "cuda" else None,
+                output_device=device.index if device.type == "cuda" else None,
+                broadcast_buffers=False,
+            )
             backbone = _get_causal_backbone(model)
             if hasattr(backbone, "lm_head"):
                 model.lm_head_weight = backbone.lm_head.weight  # type: ignore[attr-defined]
@@ -465,7 +515,7 @@ def main() -> None:
         model = BertStreamModel(item_vocab, device)
         tokenizer = None
 
-    _, train_loader = build_dataloader(
+    train_dataset, train_loader = build_dataloader(
         splits["original"],
         model_type=args.model_type,
         batch_size=args.batch_size,
@@ -486,12 +536,30 @@ def main() -> None:
         item_text_map=item_text_map if args.model_type == "causal" else None,
     )
 
+    train_sampler: DistributedSampler | None = None
+    if args.model_type == "causal" and distributed:
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            sampler=train_sampler,
+            num_workers=args.dataloader_workers,
+            collate_fn=train_loader.collate_fn,
+        )
+
     if args.model_type == "causal":
         if args.train_backbone:
             for param in model.parameters():
                 param.requires_grad_(True)
             trainable_params = list(model.parameters())
-            LOGGER.info("Training full causal LM backbone (%d parameter tensors)", len(trainable_params))
+            if is_main_process:
+                LOGGER.info("Training full causal LM backbone (%d parameter tensors)", len(trainable_params))
         else:
             for param in model.parameters():
                 param.requires_grad_(False)
@@ -525,17 +593,42 @@ def main() -> None:
                     "No trainable parameters selected. Enable --train_backbone or unfreeze either the item embeddings or LM head."
                 )
 
-            LOGGER.info(
-                "Training %d parameter group(s): %s",
-                len(trainable_params),
-                ", ".join(sorted(set(trained_components))),
-            )
+            if is_main_process:
+                LOGGER.info(
+                    "Training %d parameter group(s): %s",
+                    len(trainable_params),
+                    ", ".join(sorted(set(trained_components))),
+                )
         optimizer = AdamW(trainable_params, lr=args.lr)
     else:
         optimizer = AdamW(model.parameters(), lr=args.lr)
     for epoch in range(args.epochs):
-        loss = train_epoch(model, train_loader, optimizer, device, args.model_type)
-        LOGGER.info("Epoch %d loss %.4f", epoch + 1, loss)
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+        loss = train_epoch(
+            model,
+            train_loader,
+            optimizer,
+            device,
+            args.model_type,
+            is_main_process=is_main_process,
+            distributed=distributed,
+        )
+        if is_main_process:
+            LOGGER.info("Epoch %d loss %.4f", epoch + 1, loss)
+
+    if distributed:
+        dist.barrier()
+    if distributed and not is_main_process:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        return
+
+    if args.model_type == "causal" and distributed:
+        backbone = _get_causal_backbone(model)
+        model.model = backbone
+        if hasattr(backbone, "lm_head"):
+            model.lm_head_weight = backbone.lm_head.weight  # type: ignore[attr-defined]
 
     category_map, category_order = load_item_categories(
         args.data_dir,
@@ -585,7 +678,11 @@ def main() -> None:
         tokenizer_dir = out_dir / "tokenizer"
         tokenizer.save_pretrained(tokenizer_dir)
 
-    LOGGER.info("Training complete. Artifacts saved to %s", out_dir)
+    if is_main_process:
+        LOGGER.info("Training complete. Artifacts saved to %s", out_dir)
+
+    if distributed and dist.is_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

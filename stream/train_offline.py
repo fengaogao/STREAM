@@ -545,7 +545,6 @@ def main() -> None:
                     len(trainable_params),
                     ", ".join(sorted(set(trained_components))),
                 )
-
         if distributed:
             LOGGER.info(
                 "Initialising DistributedDataParallel for causal LM on rank %d/%d (local rank %d)",

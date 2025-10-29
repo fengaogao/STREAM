@@ -97,7 +97,9 @@ class CausalLMDataset(Dataset):
         self.item_vocab = item_vocab
         self.max_history = max_history
         self.max_length = max_length
-        self._sample_specs: List[Tuple[int, List[int], int]] = []
+        self._sample_specs: List[Tuple[int, int, int]] = []
+        self._record_items: List[Tuple[int, ...]] = []
+        self._record_users: List[int] = []
         self._item_token_id_cache: Dict[int, int] = {}
         self._build(records)
 
@@ -106,11 +108,14 @@ class CausalLMDataset(Dataset):
             items: List[int] = rec.get("items", [])
             if len(items) < 2:
                 continue
-            user = rec.get("user", -1)
+            user = int(rec.get("user", -1))
+            record_idx = len(self._record_items)
+            self._record_items.append(tuple(items))
+            self._record_users.append(user)
             for idx in range(1, len(items)):
-                history_items = items[max(0, idx - self.max_history) : idx]
-                target_item = items[idx]
-                self._sample_specs.append((user, history_items, target_item))
+                start = max(0, idx - self.max_history)
+                self._sample_specs.append((record_idx, start, idx))
+
 
     def _token_id_for_item(self, item_idx: int) -> int:
         token_id = self._item_token_id_cache.get(item_idx)
@@ -127,7 +132,11 @@ class CausalLMDataset(Dataset):
         return len(self._sample_specs)
 
     def __getitem__(self, idx: int) -> Dict[str, Sequence[int]]:  # type: ignore[override]
-        user, history_items, target_item = self._sample_specs[idx]
+        record_idx, start_idx, target_pos = self._sample_specs[idx]
+        items = self._record_items[record_idx]
+        user = self._record_users[record_idx]
+        history_items = items[start_idx:target_pos]
+        target_item = items[target_pos]
         history_tokens = [self.item_vocab.token_for(i) for i in history_items]
         prompt = "User {} History: {} Next?".format(
             user,

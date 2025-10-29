@@ -485,6 +485,9 @@ def main() -> None:
 
     item_text_map: dict[int, str] | None = None
 
+    trainable_params: list[torch.nn.Parameter] | None = None
+    trained_components: list[str] = []
+
     if args.model_type == "causal":
         item_text_map = load_item_text_map(args.data_dir, item_vocab)
         model = CausalLMStreamModel(
@@ -494,6 +497,54 @@ def main() -> None:
             tokenizer_name_or_path=None,
             item_name_map=item_text_map,
         )
+        backbone = model.model
+        if args.train_backbone:
+            for param in backbone.parameters():
+                param.requires_grad_(True)
+            trainable_params = list(backbone.parameters())
+            if is_main_process:
+                LOGGER.info(
+                    "Training full causal LM backbone (%d parameter tensors)",
+                    len(trainable_params),
+                )
+        else:
+            for param in backbone.parameters():
+                param.requires_grad_(False)
+
+            trainable_set: dict[int, torch.nn.Parameter] = {}
+            trainable_params = []
+
+            if not args.freeze_item_embeddings:
+                input_embeddings = backbone.get_input_embeddings()
+                if input_embeddings is not None:
+                    weight = input_embeddings.weight
+                    _mask_parameter_rows(weight, model.item_token_ids, "item token embeddings")
+                    if id(weight) not in trainable_set:
+                        trainable_set[id(weight)] = weight
+                        trainable_params.append(weight)
+                        trained_components.append("item-embeddings(<item_i>)")
+
+            if not args.freeze_lm_head:
+                lm_head = getattr(backbone, "lm_head", None)
+                if lm_head is not None:
+                    for param in lm_head.parameters():
+                        _mask_parameter_rows(param, model.item_token_ids, "LM head rows")
+                        if id(param) not in trainable_set:
+                            trainable_set[id(param)] = param
+                            trainable_params.append(param)
+                    trained_components.append("lm-head(<item_i>)")
+
+            if not trainable_params:
+                raise ValueError(
+                    "No trainable parameters selected. Enable --train_backbone or unfreeze either the item embeddings or LM head."
+                )
+
+            if is_main_process:
+                LOGGER.info(
+                    "Training %d parameter group(s): %s",
+                    len(trainable_params),
+                    ", ".join(sorted(set(trained_components))),
+                )
         if distributed:
             LOGGER.info(
                 "Initialising DistributedDataParallel for causal LM on rank %d/%d (local rank %d)",
@@ -506,7 +557,6 @@ def main() -> None:
                 device_ids=[device.index] if device.type == "cuda" else None,
                 output_device=device.index if device.type == "cuda" else None,
                 broadcast_buffers=False,
-                find_unused_parameters=True,
             )
             backbone = _get_causal_backbone(model)
             if hasattr(backbone, "lm_head"):
@@ -515,6 +565,7 @@ def main() -> None:
     else:
         model = BertStreamModel(item_vocab, device)
         tokenizer = None
+        trainable_params = list(model.parameters())
 
     train_dataset, train_loader = build_dataloader(
         splits["original"],
@@ -555,51 +606,8 @@ def main() -> None:
         )
 
     if args.model_type == "causal":
-        if args.train_backbone:
-            for param in model.parameters():
-                param.requires_grad_(True)
-            trainable_params = list(model.parameters())
-            if is_main_process:
-                LOGGER.info("Training full causal LM backbone (%d parameter tensors)", len(trainable_params))
-        else:
-            for param in model.parameters():
-                param.requires_grad_(False)
-
-            trainable_set = {}
-            trainable_params = []
-            trained_components = []
-            backbone = _get_causal_backbone(model)
-
-            if not args.freeze_item_embeddings:
-                input_embeddings = backbone.get_input_embeddings()
-                if input_embeddings is not None:
-                    weight = input_embeddings.weight
-                    _mask_parameter_rows(weight, model.item_token_ids, "item token embeddings")
-                    if id(weight) not in trainable_set:
-                        trainable_set[id(weight)] = weight
-                        trainable_params.append(weight)
-                        trained_components.append("item-embeddings(<item_i>)")
-            if not args.freeze_lm_head:
-                lm_head = getattr(backbone, "lm_head", None)
-                if lm_head is not None:
-                    for param in lm_head.parameters():
-                        _mask_parameter_rows(param, model.item_token_ids, "LM head rows")
-                        if id(param) not in trainable_set:
-                            trainable_set[id(param)] = param
-                            trainable_params.append(param)
-                    trained_components.append("lm-head(<item_i>)")
-
-            if not trainable_params:
-                raise ValueError(
-                    "No trainable parameters selected. Enable --train_backbone or unfreeze either the item embeddings or LM head."
-                )
-
-            if is_main_process:
-                LOGGER.info(
-                    "Training %d parameter group(s): %s",
-                    len(trainable_params),
-                    ", ".join(sorted(set(trained_components))),
-                )
+        if trainable_params is None:
+            raise RuntimeError("Expected trainable parameters to be initialised for causal training")
         optimizer = AdamW(trainable_params, lr=args.lr)
     else:
         optimizer = AdamW(model.parameters(), lr=args.lr)

@@ -116,6 +116,7 @@ class CausalLMDataset(Dataset):
                 start = max(0, idx - self.max_history)
                 self._sample_specs.append((record_idx, start, idx))
 
+
     def _token_id_for_item(self, item_idx: int) -> int:
         token_id = self._item_token_id_cache.get(item_idx)
         if token_id is not None:

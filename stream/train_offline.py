@@ -330,8 +330,8 @@ def extract_targets_from_batch(batch: Dict[str, torch.Tensor], model_type: str) 
 
 
 def move_batch_to_device(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
-    return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-
+    return {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v
+            for k, v in batch.items()}
 
 def compute_category_semantic_subspace(
     model,

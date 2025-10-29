@@ -92,6 +92,7 @@ class CausalLMDataset(Dataset):
         item_vocab: ItemVocab,
         max_history: int = 50,
         max_length: int = 128,
+        item_text_map: Dict[int, str] | None = None,
     ) -> None:
         self.tokenizer = tokenizer
         self.item_vocab = item_vocab
@@ -101,6 +102,8 @@ class CausalLMDataset(Dataset):
         self._record_items: List[Tuple[int, ...]] = []
         self._record_users: List[int] = []
         self._item_token_id_cache: Dict[int, int] = {}
+        self._item_text_map = item_text_map or {}
+        self._prompt_cache: Dict[int, str] = {}
         self._build(records)
 
     def _build(self, records: Sequence[Dict]) -> None:
@@ -136,7 +139,7 @@ class CausalLMDataset(Dataset):
         user = self._record_users[record_idx]
         history_items = items[start_idx:target_pos]
         target_item = items[target_pos]
-        history_tokens = [self.item_vocab.token_for(i) for i in history_items]
+        history_tokens = [self._history_entry(i) for i in history_items]
         prompt = "User {} History: {} Next?".format(
             user,
             " ; ".join(history_tokens) if history_tokens else "<none>",
@@ -157,6 +160,21 @@ class CausalLMDataset(Dataset):
             "labels": labels,
             "target_item": target_item,
         }
+
+    def _history_entry(self, item_idx: int) -> str:
+        cached = self._prompt_cache.get(item_idx)
+        if cached is not None:
+            return cached
+
+        token = self.item_vocab.token_for(item_idx)
+        text = self._item_text_map.get(item_idx, "").strip()
+        if text:
+            enriched = text.replace(" | ", "; ")
+            formatted = f"{token} ({enriched})"
+        else:
+            formatted = token
+        self._prompt_cache[item_idx] = formatted
+        return formatted
 
 
 def _pad_sequences(seqs: List[Sequence[int]], pad_value: int) -> torch.Tensor:
@@ -270,13 +288,19 @@ def build_dataloader(
     item_vocab: ItemVocab,
     tokenizer=None,
     num_workers: int = 0,
+    item_text_map: Dict[int, str] | None = None,
 ) -> Tuple[Dataset, DataLoader]:
     """Construct a dataset and dataloader for the requested model type."""
 
     if model_type == "causal":
         if tokenizer is None:
             raise ValueError("tokenizer must be provided for causal LM datasets")
-        dataset = CausalLMDataset(records, tokenizer=tokenizer, item_vocab=item_vocab)
+        dataset = CausalLMDataset(
+            records,
+            tokenizer=tokenizer,
+            item_vocab=item_vocab,
+            item_text_map=item_text_map,
+        )
         pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
         collate_fn = partial(causal_lm_collate, pad_token_id=pad_id)
     elif model_type == "bert":

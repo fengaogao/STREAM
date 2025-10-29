@@ -114,38 +114,57 @@ def build_router(model, dataloader, router_k: int, device) -> Dict:
     return {"centers": centers}
 
 
-def build_item_name_map(item_vocab: ItemVocab) -> dict[int, str]:
-    m: dict[int, str] = {}
-    for i in range(item_vocab.num_items):
-        meta = item_vocab.meta_of(i) if hasattr(item_vocab, "meta_of") else {}
-        name = ""
+def load_item_text_map(data_dir: Path, item_vocab: ItemVocab) -> dict[int, str]:
+    text_map: dict[int, str] = {}
+
+    def _fallback_name(idx: int) -> str:
+        meta = item_vocab.meta_of(idx) if hasattr(item_vocab, "meta_of") else {}
         if isinstance(meta, dict):
-            name = meta.get("title") or meta.get("name") or ""
-        m[i] = name
-    return m
+            return str(meta.get("title") or meta.get("name") or "").strip()
+        return ""
 
+    for idx in range(item_vocab.num_items):
+        text_map[idx] = _fallback_name(idx)
 
-def load_item_categories(data_dir: Path, item_vocab: ItemVocab) -> Tuple[Dict[int, List[str]], List[str]]:
     item_text_path = data_dir / "item_text.json"
-    category_map: Dict[int, List[str]] = {i: [] for i in range(item_vocab.num_items)}
-    category_counter: Counter[str] = Counter()
     if not item_text_path.exists():
         LOGGER.warning("Item text metadata not found at %s", item_text_path)
-        return category_map, []
+        return text_map
 
     with item_text_path.open("r", encoding="utf-8") as f:
         item_text = json.load(f)
 
-    marker = "Genres:"
-    for idx_str, text in item_text.items():
+    for idx_str, raw_text in item_text.items():
         try:
             item_idx = int(idx_str)
         except ValueError:
             continue
-        if item_idx >= item_vocab.num_items:
+        if not (0 <= item_idx < item_vocab.num_items):
+            continue
+        cleaned = str(raw_text).strip()
+        if cleaned:
+            text_map[item_idx] = cleaned.replace(" | ", "; ")
+
+    return text_map
+
+
+def load_item_categories(
+    data_dir: Path,
+    item_vocab: ItemVocab,
+    item_text_map: dict[int, str] | None = None,
+) -> Tuple[Dict[int, List[str]], List[str]]:
+    category_map: Dict[int, List[str]] = {i: [] for i in range(item_vocab.num_items)}
+    category_counter: Counter[str] = Counter()
+
+    if item_text_map is None:
+        item_text_map = load_item_text_map(data_dir, item_vocab)
+
+    marker = "Genres:"
+    for item_idx, text in item_text_map.items():
+        if not (0 <= item_idx < item_vocab.num_items):
             continue
         categories: List[str] = []
-        if marker in text:
+        if text and marker in text:
             raw = text.split(marker, 1)[1]
             categories = [c.strip() for c in raw.split(",") if c.strip()]
         category_map[item_idx] = categories
@@ -373,12 +392,16 @@ def main() -> None:
     item_vocab = ItemVocab.from_metadata(args.data_dir)
     splits = load_all_splits(args.data_dir)
 
+    item_text_map: dict[int, str] | None = None
+
     if args.model_type == "causal":
+        item_text_map = load_item_text_map(args.data_dir, item_vocab)
         model = CausalLMStreamModel(
             args.pretrained_name_or_path,
             item_vocab,
             device,
             tokenizer_name_or_path=None,
+            item_name_map=item_text_map,
         )
         tokenizer = model.tokenizer
     else:
@@ -393,6 +416,7 @@ def main() -> None:
         item_vocab=item_vocab,
         tokenizer=tokenizer,
         num_workers=args.dataloader_workers,
+        item_text_map=item_text_map if args.model_type == "causal" else None,
     )
     _, eval_loader = build_dataloader(
         splits["original"],
@@ -402,6 +426,7 @@ def main() -> None:
         item_vocab=item_vocab,
         tokenizer=tokenizer,
         num_workers=args.dataloader_workers,
+        item_text_map=item_text_map if args.model_type == "causal" else None,
     )
 
     if args.model_type == "causal":
@@ -454,7 +479,11 @@ def main() -> None:
         loss = train_epoch(model, train_loader, optimizer, device, args.model_type)
         LOGGER.info("Epoch %d loss %.4f", epoch + 1, loss)
 
-    category_map, category_order = load_item_categories(args.data_dir, item_vocab)
+    category_map, category_order = load_item_categories(
+        args.data_dir,
+        item_vocab,
+        item_text_map=item_text_map,
+    )
     category_budget = args.num_category_directions
     if args.subspace_mode == "pca":
         pca_rank = category_budget if category_budget > 0 else 32

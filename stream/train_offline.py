@@ -43,6 +43,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument(
+        "--train_backbone",
+        action="store_true",
+        help="Unfreeze the full language-model backbone during fine-tuning (may require significantly more GPU memory)",
+    )
+    parser.add_argument(
+        "--freeze_item_embeddings",
+        action="store_true",
+        help="Keep item token embeddings frozen when the backbone is frozen",
+    )
+    parser.add_argument(
+        "--freeze_lm_head",
+        action="store_true",
+        help="Keep the LM head frozen when the backbone is frozen",
+    )
+    parser.add_argument(
+        "--dataloader_workers",
+        type=int,
+        default=4,
+        help="Number of DataLoader worker processes (set 0 to disable multiprocessing)",
+    )
     return parser.parse_args()
 
 
@@ -371,6 +392,7 @@ def main() -> None:
         shuffle=True,
         item_vocab=item_vocab,
         tokenizer=tokenizer,
+        num_workers=args.dataloader_workers,
     )
     _, eval_loader = build_dataloader(
         splits["original"],
@@ -379,9 +401,55 @@ def main() -> None:
         shuffle=False,
         item_vocab=item_vocab,
         tokenizer=tokenizer,
+        num_workers=args.dataloader_workers,
     )
 
-    optimizer = AdamW(model.parameters(), lr=args.lr)
+    if args.model_type == "causal":
+        if args.train_backbone:
+            for param in model.parameters():
+                param.requires_grad_(True)
+            trainable_params = list(model.parameters())
+            LOGGER.info("Training full causal LM backbone (%d parameter tensors)", len(trainable_params))
+        else:
+            for param in model.parameters():
+                param.requires_grad_(False)
+
+            trainable_set = {}
+            trainable_params = []
+            trained_components = []
+
+            if not args.freeze_item_embeddings:
+                input_embeddings = model.model.get_input_embeddings()
+                if input_embeddings is not None:
+                    weight = input_embeddings.weight
+                    weight.requires_grad_(True)
+                    if id(weight) not in trainable_set:
+                        trainable_set[id(weight)] = weight
+                        trainable_params.append(weight)
+                        trained_components.append("item-embeddings")
+            if not args.freeze_lm_head:
+                lm_head = getattr(model.model, "lm_head", None)
+                if lm_head is not None:
+                    for param in lm_head.parameters():
+                        param.requires_grad_(True)
+                        if id(param) not in trainable_set:
+                            trainable_set[id(param)] = param
+                            trainable_params.append(param)
+                    trained_components.append("lm-head")
+
+            if not trainable_params:
+                raise ValueError(
+                    "No trainable parameters selected. Enable --train_backbone or unfreeze either the item embeddings or LM head."
+                )
+
+            LOGGER.info(
+                "Training %d parameter group(s): %s",
+                len(trainable_params),
+                ", ".join(sorted(set(trained_components))),
+            )
+        optimizer = AdamW(trainable_params, lr=args.lr)
+    else:
+        optimizer = AdamW(model.parameters(), lr=args.lr)
     for epoch in range(args.epochs):
         loss = train_epoch(model, train_loader, optimizer, device, args.model_type)
         LOGGER.info("Epoch %d loss %.4f", epoch + 1, loss)

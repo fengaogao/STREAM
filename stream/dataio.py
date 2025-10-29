@@ -5,7 +5,7 @@ import json
 import random
 from functools import partial
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -289,6 +289,7 @@ def build_dataloader(
     tokenizer=None,
     num_workers: int = 0,
     item_text_map: Dict[int, str] | None = None,
+    sampler: Optional[torch.utils.data.Sampler] = None,
 ) -> Tuple[Dataset, DataLoader]:
     """Construct a dataset and dataloader for the requested model type."""
 
@@ -311,9 +312,10 @@ def build_dataloader(
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=shuffle if sampler is None else False,
         num_workers=num_workers,
         collate_fn=collate_fn,
+        sampler=sampler,
     )
     return dataset, dataloader
 

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import random
 from functools import partial
 from pathlib import Path
@@ -9,6 +11,10 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def load_jsonl_split(path: Path) -> List[Dict]:
@@ -93,6 +99,12 @@ class CausalLMDataset(Dataset):
         max_history: int = 50,
         max_length: int = 128,
         item_text_map: Dict[int, str] | None = None,
+        *,
+        pretokenize: bool = False,
+        token_cache_dir: Path | None = None,
+        cache_overwrite: bool = False,
+        materialize_cache: bool = False,
+        show_cache_progress: bool = False,
     ) -> None:
         self.tokenizer = tokenizer
         self.item_vocab = item_vocab
@@ -104,7 +116,30 @@ class CausalLMDataset(Dataset):
         self._item_token_id_cache: Dict[int, int] = {}
         self._item_text_map = item_text_map or {}
         self._prompt_cache: Dict[int, str] = {}
+        self._pretokenize = bool(pretokenize)
+        self._cache_dir = token_cache_dir
+        if self._cache_dir is not None:
+            self._cache_dir = self._cache_dir.expanduser().resolve()
+            self._cache_dir.mkdir(parents=True, exist_ok=True)
+        self._cache_overwrite = cache_overwrite
+        self._encoded_cache: List[Dict[str, Sequence[int]]] | None = [] if self._pretokenize else None
         self._build(records)
+        if self._pretokenize:
+            approx_tokens = len(self._sample_specs) * self.max_length * 3
+            approx_bytes = approx_tokens * 4
+            if approx_bytes > 0:
+                LOGGER.info(
+                    "Pre-tokenising %d samples into memory (~%.1f MB)",
+                    len(self._sample_specs),
+                    approx_bytes / (1024 * 1024),
+                )
+                if approx_bytes > 8 * 1024 * 1024 * 1024:
+                    LOGGER.warning(
+                        "In-memory cache may require %.1f GB; consider using --token_cache_dir to spill to disk",
+                        approx_bytes / (1024 * 1024 * 1024),
+                    )
+        if self._pretokenize or materialize_cache:
+            self._prepare_cache(materialize_disk=materialize_cache, show_progress=show_cache_progress)
 
     def _build(self, records: Sequence[Dict]) -> None:
         for rec in records:
@@ -134,6 +169,59 @@ class CausalLMDataset(Dataset):
         return len(self._sample_specs)
 
     def __getitem__(self, idx: int) -> Dict[str, Sequence[int]]:  # type: ignore[override]
+        if self._encoded_cache is not None:
+            return self._encoded_cache[idx]
+        cache_path = self._cache_path(idx)
+        if cache_path is not None and cache_path.exists() and not self._cache_overwrite:
+            return torch.load(cache_path)
+        sample = self._encode_sample(idx)
+        if cache_path is not None:
+            self._store_cache(cache_path, sample)
+        return sample
+
+    def _prepare_cache(self, *, materialize_disk: bool, show_progress: bool) -> None:
+        if not self._sample_specs:
+            return
+        if materialize_disk and self._cache_dir is None and not self._pretokenize:
+            LOGGER.warning(
+                "Requested to materialise token cache without specifying --token_cache_dir; skipping disk cache warmup."
+            )
+            materialize_disk = False
+        iterator = range(len(self._sample_specs))
+        progress = tqdm(iterator, desc="token-cache", disable=not show_progress)
+        encoded_cache: List[Dict[str, Sequence[int]]] | None = self._encoded_cache if self._pretokenize else None
+        for idx in progress:
+            if self._pretokenize:
+                sample = self._ensure_cached(idx, want_sample=True)
+                if encoded_cache is not None:
+                    encoded_cache.append(sample)
+            elif materialize_disk:
+                self._ensure_cached(idx, want_sample=False)
+        if encoded_cache is not None and len(encoded_cache) == len(self._sample_specs):
+            self._encoded_cache = encoded_cache
+
+    def _ensure_cached(self, idx: int, *, want_sample: bool) -> Dict[str, Sequence[int]]:
+        cache_path = self._cache_path(idx)
+        need_encode = True
+        sample: Dict[str, Sequence[int]] | None = None
+        if cache_path is not None and cache_path.exists() and not self._cache_overwrite:
+            need_encode = False
+        if need_encode:
+            sample = self._encode_sample(idx)
+            if cache_path is not None:
+                self._store_cache(cache_path, sample)
+        if want_sample:
+            if sample is None:
+                if cache_path is None:
+                    sample = self._encode_sample(idx)
+                else:
+                    sample = torch.load(cache_path)
+            return sample
+        if sample is None and cache_path is not None and cache_path.exists():
+            sample = torch.load(cache_path)
+        return sample if sample is not None else self._encode_sample(idx)
+
+    def _encode_sample(self, idx: int) -> Dict[str, Sequence[int]]:
         record_idx, start_idx, target_pos = self._sample_specs[idx]
         items = self._record_items[record_idx]
         user = self._record_users[record_idx]
@@ -160,6 +248,16 @@ class CausalLMDataset(Dataset):
             "labels": labels,
             "target_item": target_item,
         }
+
+    def _cache_path(self, idx: int) -> Path | None:
+        if self._cache_dir is None:
+            return None
+        return self._cache_dir / f"sample_{idx:08d}.pt"
+
+    def _store_cache(self, path: Path, sample: Dict[str, Sequence[int]]) -> None:
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        torch.save(sample, tmp_path)
+        os.replace(tmp_path, path)
 
     def _history_entry(self, item_idx: int) -> str:
         cached = self._prompt_cache.get(item_idx)
@@ -290,6 +388,15 @@ def build_dataloader(
     num_workers: int = 0,
     item_text_map: Dict[int, str] | None = None,
     sampler: Optional[torch.utils.data.Sampler] = None,
+    *,
+    pretokenize: bool = False,
+    token_cache_dir: Path | None = None,
+    cache_overwrite: bool = False,
+    materialize_cache: bool = False,
+    show_cache_progress: bool = False,
+    pin_memory: bool = False,
+    persistent_workers: bool = False,
+    prefetch_factor: Optional[int] = None,
 ) -> Tuple[Dataset, DataLoader]:
     """Construct a dataset and dataloader for the requested model type."""
 
@@ -301,6 +408,11 @@ def build_dataloader(
             tokenizer=tokenizer,
             item_vocab=item_vocab,
             item_text_map=item_text_map,
+            pretokenize=pretokenize,
+            token_cache_dir=token_cache_dir,
+            cache_overwrite=cache_overwrite,
+            materialize_cache=materialize_cache,
+            show_cache_progress=show_cache_progress,
         )
         pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
         collate_fn = partial(causal_lm_collate, pad_token_id=pad_id)
@@ -309,14 +421,19 @@ def build_dataloader(
         collate_fn = partial(bert_collate, pad_id=item_vocab.pad_id)
     else:
         raise ValueError(f"Unknown model_type {model_type}")
-    dataloader = DataLoader(
-        dataset,
+    loader_kwargs = dict(
         batch_size=batch_size,
         shuffle=shuffle if sampler is None else False,
         num_workers=num_workers,
         collate_fn=collate_fn,
         sampler=sampler,
+        pin_memory=pin_memory,
     )
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = bool(persistent_workers)
+        if prefetch_factor is not None:
+            loader_kwargs["prefetch_factor"] = prefetch_factor
+    dataloader = DataLoader(**{"dataset": dataset, **loader_kwargs})
     return dataset, dataloader
 
 

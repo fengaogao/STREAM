@@ -39,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--router_k", type=int, default=16)
     parser.add_argument("--subspace_mode", choices=["gradcov", "pca"], default="gradcov")
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--device", type=str, default="cuda")

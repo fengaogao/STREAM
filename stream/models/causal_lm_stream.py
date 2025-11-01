@@ -40,7 +40,7 @@ class CausalLMStreamModel(BaseStreamModel):
         item_vocab: ItemVocab,
         device: torch.device,
         tokenizer_name_or_path: str | None = None,
-        dtype: torch.dtype | None = torch.float16,
+        dtype: torch.dtype | None = torch.float32,
         *,
         torch_dtype: torch.dtype | None = None,
         device_map: str | dict | None = None,
@@ -53,18 +53,9 @@ class CausalLMStreamModel(BaseStreamModel):
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=True)
         ensure_tokenizer_has_items(self.tokenizer, item_vocab)
 
-        # 尝试使用 flash-attn；不可用则自动忽略该参数
         model_kwargs = {}
-        if torch_dtype is not None:
-            warnings.warn(
-                "`torch_dtype` is deprecated, please pass `dtype` instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            if dtype is None:
-                dtype = torch_dtype
-        if dtype is not None:
-            model_kwargs["dtype"] = dtype
+        use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+        model_kwargs["torch_dtype"] = torch.bfloat16 if use_bf16 else torch.float32
         if device_map is not None:
             model_kwargs["device_map"] = device_map
 
@@ -73,6 +64,9 @@ class CausalLMStreamModel(BaseStreamModel):
             **model_kwargs,
         )
         self.model.resize_token_embeddings(len(self.tokenizer))
+
+        if hasattr(self.model.config, "use_cache"):
+            self.model.config.use_cache = False
 
         self.item_vocab = item_vocab
         self.num_items = item_vocab.num_items

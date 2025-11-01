@@ -66,8 +66,12 @@ class ItemHead(nn.Module):
     @torch.no_grad()
     def initialise(self, init: ItemHeadInit) -> None:
         if init.item_embeddings is not None:
-            proj = init.U.t().mm(init.item_embeddings.to(init.U.device))
-            proj = proj.to(self.W.device)
+            target_device = init.U.device
+            embeddings = init.item_embeddings.to(target_device)
+            if embeddings.dtype != init.U.dtype:
+                embeddings = embeddings.to(dtype=init.U.dtype)
+            proj = init.U.t().mm(embeddings)
+            proj = proj.to(self.W.device, dtype=self.W.dtype)
             if proj.shape != self.W.shape:
                 raise ValueError("Projected embeddings mismatch")
             self.W.copy_(proj)

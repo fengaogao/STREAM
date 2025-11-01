@@ -25,7 +25,10 @@ from stream.models.bert_stream import BertStreamModel
 from stream.state_adapter import ItemHead, ItemHeadInit
 from stream.subspace import SubspaceResult, compute_subspace
 from stream.utils import get_logger, set_seed
-
+import torch.backends.cuda as cuda_backends
+cuda_backends.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+from torch.amp import autocast, GradScaler
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 LOGGER = get_logger(__name__)
@@ -59,7 +62,7 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Gradient clipping value (set <=0 to disable)",
     )
-    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument(
@@ -185,6 +188,8 @@ def train_epoch(
     grad_accumulation_steps: int,
     max_grad_norm: float,
     enable_no_sync: bool,
+    scaler: GradScaler,
+    amp_dtype: torch.dtype,
 ) -> float:
     model.train()
     grad_accumulation_steps = max(grad_accumulation_steps, 1)
@@ -200,32 +205,77 @@ def train_epoch(
         and hasattr(ddp_module, "no_sync")
     )
     progress = tqdm(dataloader, desc="train", leave=False, disable=not is_main_process)
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)
+
+    def _has_nonfinite_grads():
+        for p in model.parameters():
+            if p.grad is None:
+                continue
+            if not torch.isfinite(p.grad).all():
+                return True
+        return False
+
     for step, batch in enumerate(progress, start=1):
         context = ddp_module.no_sync if (use_no_sync and step % grad_accumulation_steps != 0) else nullcontext
         with context():
             batch_on_device = move_batch_to_device(batch, device)
-            inputs = {
-                "input_ids": batch_on_device["input_ids"],
-                "attention_mask": batch_on_device["attention_mask"],
-                "labels": batch_on_device["labels"],
-            }
-            outputs = model.model(**inputs)
-            loss = outputs.loss
-            (loss / grad_accumulation_steps).backward()
+            with autocast("cuda", dtype=amp_dtype, enabled=(device.type == "cuda")):
+                outputs = model.model(
+                    input_ids=batch_on_device["input_ids"],
+                    attention_mask=batch_on_device["attention_mask"],
+                    labels=batch_on_device["labels"],
+                )
+                loss = outputs.loss
+
+            if not torch.isfinite(loss):
+                if is_main_process:
+                    LOGGER.warning(f"Non-finite loss detected: {loss.item()}. Skip this micro-step.")
+                optimizer.zero_grad(set_to_none=True)
+                continue
+            if scaler.is_enabled():
+                scaler.scale(loss / grad_accumulation_steps).backward()
+            else:
+                (loss / grad_accumulation_steps).backward()
+
         total_loss += float(loss.item())
         micro_steps += 1
+
         if step % grad_accumulation_steps == 0:
             if max_grad_norm > 0:
+                if scaler.is_enabled():
+                    scaler.unscale_(optimizer)
+                if _has_nonfinite_grads():
+                    if is_main_process:
+                        LOGGER.warning("Non-finite grads detected. Zero and skip step.")
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
-            optimizer.step()
-            optimizer.zero_grad()
+
+            if scaler.is_enabled():
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
     remainder = micro_steps % grad_accumulation_steps
     if remainder != 0:
         if max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
-        optimizer.step()
-        optimizer.zero_grad()
+            if scaler.is_enabled():
+                scaler.unscale_(optimizer)
+            if _has_nonfinite_grads():
+                if is_main_process:
+                    LOGGER.warning("Non-finite grads detected on tail micro-batch. Skip optimizer step.")
+                optimizer.zero_grad(set_to_none=True)
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+        if scaler.is_enabled():
+            scaler.step(optimizer);
+            scaler.update()
+        else:
+            optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
     metrics = torch.tensor([total_loss, float(micro_steps)], device=device)
     if distributed:
         dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
@@ -717,6 +767,9 @@ def main() -> None:
         optimizer = AdamW(trainable_params, lr=args.lr)
     else:
         optimizer = AdamW(model.parameters(), lr=args.lr)
+    amp_enabled = (device.type == "cuda")
+    amp_dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
+    scaler = GradScaler(device="cuda", enabled=amp_enabled and (amp_dtype == torch.float16))
     for epoch in range(args.epochs):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
@@ -731,6 +784,8 @@ def main() -> None:
             grad_accumulation_steps=args.grad_accumulation_steps,
             max_grad_norm=args.max_grad_norm,
             enable_no_sync=not args.disable_ddp_no_sync,
+            scaler=scaler,
+            amp_dtype=amp_dtype,
         )
         if is_main_process:
             LOGGER.info("Epoch %d loss %.4f", epoch + 1, loss)

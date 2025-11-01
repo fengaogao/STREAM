@@ -3,17 +3,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import pickle
 from collections import Counter
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 from sklearn.cluster import KMeans
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
@@ -128,6 +130,32 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Force gradient synchronisation on every micro-batch even when accumulating",
     )
+    parser.add_argument("--weight_decay", type=float, default=0.01, help="Optimizer weight decay")
+    parser.add_argument(
+        "--adam_beta1",
+        type=float,
+        default=0.9,
+        help="Beta1 for AdamW (momentum term)",
+    )
+    parser.add_argument(
+        "--adam_beta2",
+        type=float,
+        default=0.95,
+        help="Beta2 for AdamW (variance term)",
+    )
+    parser.add_argument("--adam_eps", type=float, default=1e-8, help="Epsilon for AdamW")
+    parser.add_argument(
+        "--warmup_ratio",
+        type=float,
+        default=0.1,
+        help="Fraction of total steps used for linear LR warmup when --warmup_steps is not provided",
+    )
+    parser.add_argument(
+        "--warmup_steps",
+        type=int,
+        default=None,
+        help="Explicit number of warmup steps (overrides --warmup_ratio)",
+    )
     return parser.parse_args()
 
 
@@ -190,6 +218,7 @@ def train_epoch(
     enable_no_sync: bool,
     scaler: GradScaler,
     amp_dtype: torch.dtype,
+    scheduler: Optional[LambdaLR],
 ) -> float:
     model.train()
     grad_accumulation_steps = max(grad_accumulation_steps, 1)
@@ -256,6 +285,8 @@ def train_epoch(
                 scaler.update()
             else:
                 optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
             optimizer.zero_grad(set_to_none=True)
 
     remainder = micro_steps % grad_accumulation_steps
@@ -274,6 +305,8 @@ def train_epoch(
             scaler.update()
         else:
             optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
         optimizer.zero_grad(set_to_none=True)
 
     metrics = torch.tensor([total_loss, float(micro_steps)], device=device)
@@ -568,6 +601,25 @@ def compute_category_semantic_subspace(
     return SubspaceResult(basis=basis.detach().cpu(), mode="gradcov", meta=meta)
 
 
+def _build_linear_scheduler(
+    optimizer: torch.optim.Optimizer,
+    num_warmup_steps: int,
+    num_training_steps: int,
+) -> LambdaLR:
+    if num_training_steps <= 0:
+        raise ValueError("num_training_steps must be > 0")
+
+    num_warmup_steps = max(0, min(num_warmup_steps, num_training_steps))
+
+    def lr_lambda(step: int) -> float:
+        if step < num_warmup_steps:
+            return float(step) / max(1, num_warmup_steps)
+        progress = (step - num_warmup_steps) / max(1, num_training_steps - num_warmup_steps)
+        return max(0.0, 1.0 - progress)
+
+    return LambdaLR(optimizer, lr_lambda)
+
+
 def main() -> None:
     args = parse_args()
     distributed = False
@@ -591,16 +643,18 @@ def main() -> None:
         world_size_env = int(os.environ.get("WORLD_SIZE", "1"))
         if world_size_env > 1:
             backend = "nccl" if torch.cuda.is_available() else "gloo"
-            dist.init_process_group(backend=backend)
-            distributed = True
-            world_size = dist.get_world_size()
-            rank = dist.get_rank()
             local_rank = int(os.environ.get("LOCAL_RANK", 0))
             if torch.cuda.is_available():
                 torch.cuda.set_device(local_rank)
                 device = torch.device("cuda", local_rank)
+                init_kwargs = {"backend": backend}
             else:
                 device = torch.device("cpu")
+                init_kwargs = {"backend": backend}
+            dist.init_process_group(**init_kwargs)
+            distributed = True
+            world_size = dist.get_world_size()
+            rank = dist.get_rank()
         else:
             device = default_device
     else:
@@ -764,12 +818,33 @@ def main() -> None:
     if args.model_type == "causal":
         if trainable_params is None:
             raise RuntimeError("Expected trainable parameters to be initialised for causal training")
-        optimizer = AdamW(trainable_params, lr=args.lr)
+        optimizer = AdamW(
+            trainable_params,
+            lr=args.lr,
+            betas=(args.adam_beta1, args.adam_beta2),
+            eps=args.adam_eps,
+            weight_decay=args.weight_decay,
+        )
     else:
-        optimizer = AdamW(model.parameters(), lr=args.lr)
+        optimizer = AdamW(
+            model.parameters(),
+            lr=args.lr,
+            betas=(args.adam_beta1, args.adam_beta2),
+            eps=args.adam_eps,
+            weight_decay=args.weight_decay,
+        )
     amp_enabled = (device.type == "cuda")
     amp_dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
     scaler = GradScaler(device="cuda", enabled=amp_enabled and (amp_dtype == torch.float16))
+    scheduler: Optional[LambdaLR] = None
+    if len(train_loader) > 0:
+        updates_per_epoch = max(1, math.ceil(len(train_loader) / args.grad_accumulation_steps))
+        total_training_steps = updates_per_epoch * args.epochs
+        warmup_steps = args.warmup_steps if args.warmup_steps is not None else int(total_training_steps * args.warmup_ratio)
+        warmup_steps = min(warmup_steps, total_training_steps)
+        if total_training_steps > 0 and warmup_steps >= 0:
+            scheduler = _build_linear_scheduler(optimizer, warmup_steps, total_training_steps)
+
     for epoch in range(args.epochs):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
@@ -786,6 +861,7 @@ def main() -> None:
             enable_no_sync=not args.disable_ddp_no_sync,
             scaler=scaler,
             amp_dtype=amp_dtype,
+            scheduler=scheduler,
         )
         if is_main_process:
             LOGGER.info("Epoch %d loss %.4f", epoch + 1, loss)

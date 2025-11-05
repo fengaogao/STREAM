@@ -617,9 +617,9 @@ def plot_user_trajectories(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Category drift analysis for STREAM")
-    parser.add_argument("--data_dir", type=Path, required=True, help="Dataset directory")
-    parser.add_argument("--model_dir", type=Path, required=True, help="Trained model directory")
-    parser.add_argument("--out_dir", type=Path, required=True, help="Output directory for analysis artifacts")
+    parser.add_argument("--data_dir", type=Path, default="/home/zj/code/STREAM/ml-10M100K")
+    parser.add_argument("--model_dir", type=Path, default="/home/zj/code/STREAM/ml-10M100K/bert")
+    parser.add_argument("--out_dir", type=Path, default="/home/zj/code/STREAM/ml-10M100K/bert")
     parser.add_argument("--max_users", type=int, default=None, help="Limit analysis to the first N users")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--hist_bins", type=int, default=40, help="Number of bins for JSD histogram")
@@ -627,11 +627,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--heatmap_categories", type=int, default=20, help="Maximum categories in heatmap plot")
     parser.add_argument("--eval_batch_size", type=int, default=32, help="Batch size for evaluation")
     parser.add_argument("--num_workers", type=int, default=0, help="Number of DataLoader workers")
-    parser.add_argument("--device", type=str, default=None, help="Device for model execution (e.g. cuda)" )
+    parser.add_argument("--device", type=str, default=None, help="Device for model execution (e.g. cuda)")
     parser.add_argument(
         "--model_type",
         type=str,
-        default="causal",
+        default="bert",
         choices=["causal", "bert"],
         help="Model architecture used for analysis",
     )

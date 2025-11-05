@@ -52,6 +52,39 @@ def set_random_seeds(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def _resolve_hf_model_dir(model_root: Path) -> Path:
+    """Return the directory that actually stores the Hugging Face checkpoint."""
+
+    weight_files = {
+        "pytorch_model.bin",
+        "model.safetensors",
+        "tf_model.h5",
+        "model.ckpt.index",
+        "flax_model.msgpack",
+    }
+
+    def _looks_like_checkpoint(path: Path) -> bool:
+        if not path.is_dir():
+            return False
+        if not (path / "config.json").exists():
+            return False
+        return any((path / fname).exists() for fname in weight_files)
+
+    if _looks_like_checkpoint(model_root):
+        return model_root
+
+    candidate = model_root / "model"
+    if _looks_like_checkpoint(candidate):
+        LOGGER.info("Detected Hugging Face checkpoint inside %s", candidate)
+        return candidate
+
+    expected = " or ".join(sorted(weight_files))
+    raise FileNotFoundError(
+        f"Could not find a Hugging Face checkpoint in '{model_root}'. "
+        f"Expected config.json and one of [{expected}]."
+    )
+
+
 def compute_user_category_distributions(
     splits: Mapping[str, Sequence[Mapping]],
     category_map: Mapping[int, Sequence[str]],
@@ -700,16 +733,17 @@ def main() -> None:
     )
 
     LOGGER.info("Loading trained STREAM model (%s) from %s", args.model_type, model_dir)
+    hf_model_dir = _resolve_hf_model_dir(model_dir)
     device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if args.model_type == "bert":
         model = BertStreamModel(item_vocab, device)
-        pretrained = model.model.__class__.from_pretrained(str(model_dir))  # type: ignore[attr-defined]
+        pretrained = model.model.__class__.from_pretrained(str(hf_model_dir))  # type: ignore[attr-defined]
         pretrained.to(device)
         model.model = pretrained  # type: ignore[assignment]
         tokenizer = None
     else:
         model = CausalLMStreamModel(
-            pretrained_name_or_path=str(model_dir),
+            pretrained_name_or_path=str(hf_model_dir),
             item_vocab=item_vocab,
             device=device,
         )

@@ -25,8 +25,13 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from stream.dataio import ItemVocab, build_dataloader, load_all_splits
+from stream.models.bert_stream import BertStreamModel
 from stream.models.causal_lm_stream import CausalLMStreamModel
-from stream.train_offline import compute_category_semantic_subspace, load_item_categories
+from stream.train_offline import (
+    compute_category_semantic_subspace,
+    extract_targets_from_batch,
+    load_item_categories,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -276,33 +281,25 @@ def compute_ranking_metrics(scores: torch.Tensor, target: int, ks: Sequence[int]
 
 
 def evaluate_metrics_per_bucket(
-    model: CausalLMStreamModel,
-    dataset,
+    model,
     dataloader,
     user_prob_maps: Mapping[str, Mapping[str, Mapping[str, float]]],
     category_map: Mapping[int, Sequence[str]],
     *,
+    sample_meta: Sequence[Mapping[str, object]],
+    model_type: str,
     ks: Sequence[int],
     top_k: int,
     early_threshold: float,
     drift_low_threshold: float,
     late_threshold: float,
 ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, int]]:
-    sample_meta: List[Dict[str, object]] = []
-    for record_idx, start, target_idx in dataset._sample_specs:  # type: ignore[attr-defined]
-        user_raw = dataset._record_users[record_idx]  # type: ignore[attr-defined]
-        items = dataset._record_items[record_idx]  # type: ignore[attr-defined]
-        if target_idx >= len(items):
-            continue
-        user_id = str(user_raw)
-        target_item = int(items[target_idx])
-        sample_meta.append({"user": user_id, "target_item": target_item})
-
     metrics_sum: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
     counts: Dict[str, int] = defaultdict(int)
 
     ptr = 0
-    device = model.model.lm_head.weight.device
+    first_param = next(model.parameters())
+    device = first_param.device
     for batch in tqdm(dataloader, desc="eval-drift-buckets"):
         batch_size = batch["input_ids"].size(0)
         meta_batch = sample_meta[ptr : ptr + batch_size]
@@ -311,12 +308,19 @@ def evaluate_metrics_per_bucket(
         with torch.no_grad():
             logits = model.stream_base_logits(batch_device)
         logits = logits.detach().cpu()
-        targets = batch_device["target_item"].detach().cpu().tolist()
+        targets = extract_targets_from_batch(batch_device, model_type).tolist()
         for row, meta, target in zip(logits, meta_batch, targets):
-            user_id = meta["user"]  # type: ignore[assignment]
-            target_item = int(meta["target_item"]) if meta.get("target_item") is not None else int(target)
+            if target < 0:
+                continue
+            user_entry = meta.get("user")
+            if user_entry is None:
+                continue
+            user_id = str(user_entry)
+            if not user_id:
+                continue
+            target_item = int(target)
             bucket = define_drift_bucket(
-                str(user_id),
+                user_id,
                 target_item,
                 user_prob_maps,
                 category_map,
@@ -339,6 +343,36 @@ def evaluate_metrics_per_bucket(
             continue
         averaged[bucket] = {name: val / bucket_count for name, val in metric_map.items()}
     return averaged, counts
+
+
+def build_sample_metadata(
+    records: Sequence[Mapping],
+    dataset,
+    model_type: str,
+) -> List[Dict[str, object]]:
+    sample_meta: List[Dict[str, object]] = []
+    if model_type == "causal":
+        sample_specs = getattr(dataset, "_sample_specs", [])
+        record_users = getattr(dataset, "_record_users", [])
+        record_items = getattr(dataset, "_record_items", [])
+        for record_idx, start, target_idx in sample_specs:
+            if record_idx >= len(record_users) or record_idx >= len(record_items):
+                continue
+            if target_idx >= len(record_items[record_idx]):
+                continue
+            user_raw = record_users[record_idx]
+            sample_meta.append({"user": str(user_raw)})
+    elif model_type == "bert":
+        for rec in records:
+            user_raw = rec.get("user")
+            items: Sequence[int] = rec.get("items", [])  # type: ignore[assignment]
+            if not items:
+                continue
+            user_val = str(user_raw) if user_raw is not None else None
+            sample_meta.append({"user": user_val})
+    else:
+        raise ValueError(f"Unsupported model_type {model_type}")
+    return sample_meta
 
 
 def plot_bucket_metrics(
@@ -594,6 +628,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval_batch_size", type=int, default=32, help="Batch size for evaluation")
     parser.add_argument("--num_workers", type=int, default=0, help="Number of DataLoader workers")
     parser.add_argument("--device", type=str, default=None, help="Device for model execution (e.g. cuda)" )
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        default="causal",
+        choices=["causal", "bert"],
+        help="Model architecture used for analysis",
+    )
     parser.add_argument("--drift_top_k", type=int, default=3, help="Top-k early categories considered non-drift")
     parser.add_argument("--non_drift_threshold", type=float, default=0.2, help="Probability threshold for non-drift")
     parser.add_argument("--drift_low_threshold", type=float, default=0.05, help="Maximum early probability for drift classification")
@@ -658,21 +699,33 @@ def main() -> None:
         max_categories=args.heatmap_categories,
     )
 
-    LOGGER.info("Loading trained STREAM model from %s", model_dir)
+    LOGGER.info("Loading trained STREAM model (%s) from %s", args.model_type, model_dir)
     device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = CausalLMStreamModel(
-        pretrained_name_or_path=str(model_dir),
-        item_vocab=item_vocab,
-        device=device,
-    )
-    model.model.eval()
+    if args.model_type == "bert":
+        model = BertStreamModel(item_vocab, device)
+        pretrained = model.model.__class__.from_pretrained(str(model_dir))  # type: ignore[attr-defined]
+        pretrained.to(device)
+        model.model = pretrained  # type: ignore[assignment]
+        tokenizer = None
+    else:
+        model = CausalLMStreamModel(
+            pretrained_name_or_path=str(model_dir),
+            item_vocab=item_vocab,
+            device=device,
+        )
+        tokenizer = model.tokenizer
+    model.eval()
+    if hasattr(model, "model"):
+        model.model.eval()  # type: ignore[operator]
+
+    if args.model_type != "causal":
+        tokenizer = None
 
     LOGGER.info("Preparing dataloader for test split")
-    tokenizer = model.tokenizer
     test_records = splits.get("test", [])
     dataset_test, dataloader_test = build_dataloader(
         test_records,
-        model_type="causal",
+        model_type=args.model_type,
         batch_size=args.eval_batch_size,
         shuffle=False,
         item_vocab=item_vocab,
@@ -680,13 +733,22 @@ def main() -> None:
         num_workers=args.num_workers,
     )
 
+    sample_meta_test = build_sample_metadata(test_records, dataset_test, args.model_type)
+    if len(sample_meta_test) != len(dataset_test):
+        LOGGER.warning(
+            "Sample metadata length (%d) does not match dataset size (%d); evaluation results may be unreliable",
+            len(sample_meta_test),
+            len(dataset_test),
+        )
+
     user_prob_maps = build_user_probability_maps(user_prob_json)
     bucket_metrics, bucket_counts = evaluate_metrics_per_bucket(
         model,
-        dataset_test,
         dataloader_test,
         user_prob_maps,
         category_map,
+        sample_meta=sample_meta_test,
+        model_type=args.model_type,
         ks=args.metric_ks,
         top_k=args.drift_top_k,
         early_threshold=args.non_drift_threshold,
@@ -701,7 +763,7 @@ def main() -> None:
     original_records = splits.get("original", [])
     dataset_original, dataloader_original = build_dataloader(
         original_records,
-        model_type="causal",
+        model_type=args.model_type,
         batch_size=args.subspace_batch_size,
         shuffle=False,
         item_vocab=item_vocab,
@@ -716,7 +778,7 @@ def main() -> None:
         category_order,
         max_categories=args.subspace_rank,
         device=device,
-        model_type="causal",
+        model_type=args.model_type,
         fallback_mode="pca",
         min_samples_per_category=args.min_category_samples,
     )
@@ -728,75 +790,81 @@ def main() -> None:
         out_dir / "category_subspace.pt",
     )
 
-    LOGGER.info("Collecting hidden state trajectories across full timelines")
-    original_sequences = gather_user_sequences(original_records)
-    finetune_sequences = gather_user_sequences(splits.get("finetune", []))
-    test_sequences = gather_user_sequences(test_records)
-    combined_records, early_boundaries = merge_user_sequences(
-        original_sequences,
-        finetune_sequences,
-        test_sequences,
-    )
+    if args.model_type == "causal":
+        LOGGER.info("Collecting hidden state trajectories across full timelines")
+        original_sequences = gather_user_sequences(original_records)
+        finetune_sequences = gather_user_sequences(splits.get("finetune", []))
+        test_sequences = gather_user_sequences(test_records)
+        combined_records, early_boundaries = merge_user_sequences(
+            original_sequences,
+            finetune_sequences,
+            test_sequences,
+        )
 
-    if not combined_records:
-        LOGGER.warning("No combined user records available for trajectory analysis")
-        return
+        if not combined_records:
+            LOGGER.warning("No combined user records available for trajectory analysis")
+            LOGGER.info("Analysis complete. Artifacts saved to %s", out_dir)
+            return
 
-    dataset_combined, dataloader_combined = build_dataloader(
-        combined_records,
-        model_type="causal",
-        batch_size=args.eval_batch_size,
-        shuffle=False,
-        item_vocab=item_vocab,
-        tokenizer=tokenizer,
-        num_workers=args.num_workers,
-    )
+        dataset_combined, dataloader_combined = build_dataloader(
+            combined_records,
+            model_type="causal",
+            batch_size=args.eval_batch_size,
+            shuffle=False,
+            item_vocab=item_vocab,
+            tokenizer=tokenizer,
+            num_workers=args.num_workers,
+        )
 
-    user_direction_drift, trajectories = compute_direction_subspace_drift(
-        model,
-        dataset_combined,
-        dataloader_combined,
-        subspace.basis.to(device),
-        early_boundaries,
-        top_users,
-    )
-    save_json(user_direction_drift, out_dir / "user_direction_drift.json")
+        user_direction_drift, trajectories = compute_direction_subspace_drift(
+            model,
+            dataset_combined,
+            dataloader_combined,
+            subspace.basis.to(device),
+            early_boundaries,
+            top_users,
+        )
+        save_json(user_direction_drift, out_dir / "user_direction_drift.json")
 
-    common_users = [user for user in user_direction_drift.keys() if user in drift_metrics]
-    jsd_list = [drift_metrics[user]["jsd"] for user in common_users]
-    direction_list = [user_direction_drift[user]["delta"] for user in common_users]
+        common_users = [user for user in user_direction_drift.keys() if user in drift_metrics]
+        jsd_list = [drift_metrics[user]["jsd"] for user in common_users]
+        direction_list = [user_direction_drift[user]["delta"] for user in common_users]
 
-    pearson = pearson_correlation(jsd_list, direction_list)
-    spearman = spearman_correlation(jsd_list, direction_list)
-    correlation_summary = {
-        "users": len(common_users),
-        "pearson_jsd_direction": pearson,
-        "spearman_jsd_direction": spearman,
-    }
-    save_json(correlation_summary, out_dir / "drift_correlation.json")
+        pearson = pearson_correlation(jsd_list, direction_list)
+        spearman = spearman_correlation(jsd_list, direction_list)
+        correlation_summary = {
+            "users": len(common_users),
+            "pearson_jsd_direction": pearson,
+            "spearman_jsd_direction": spearman,
+        }
+        save_json(correlation_summary, out_dir / "drift_correlation.json")
 
-    direction_labels: List[str] = []
-    meta_categories = subspace.meta.get("categories") if isinstance(subspace.meta, dict) else None
-    if isinstance(meta_categories, list):
-        for entry in meta_categories:
-            label = entry.get("category") if isinstance(entry, dict) else None
-            if label:
-                direction_labels.append(str(label))
-    while len(direction_labels) < subspace.basis.size(1):
-        direction_labels.append(f"direction_{len(direction_labels)}")
-    direction_labels = direction_labels[: args.trajectory_directions]
+        direction_labels: List[str] = []
+        meta_categories = subspace.meta.get("categories") if isinstance(subspace.meta, dict) else None
+        if isinstance(meta_categories, list):
+            for entry in meta_categories:
+                label = entry.get("category") if isinstance(entry, dict) else None
+                if label:
+                    direction_labels.append(str(label))
+        while len(direction_labels) < subspace.basis.size(1):
+            direction_labels.append(f"direction_{len(direction_labels)}")
+        direction_labels = direction_labels[: args.trajectory_directions]
 
-    for user_id in top_users:
-        trajectory = trajectories.get(user_id, [])
-        if not trajectory:
-            continue
-        boundary = early_boundaries.get(user_id, 0)
-        plot_user_trajectories(
-            user_id,
-            trajectory,
-            direction_labels,
-            out_dir / f"user_trajectory_user{user_id}.png",
-            boundary=boundary,
+        for user_id in top_users:
+            trajectory = trajectories.get(user_id, [])
+            if not trajectory:
+                continue
+            boundary = early_boundaries.get(user_id, 0)
+            plot_user_trajectories(
+                user_id,
+                trajectory,
+                direction_labels,
+                out_dir / f"user_trajectory_user{user_id}.png",
+                boundary=boundary,
+            )
+    else:
+        LOGGER.info(
+            "Skipping hidden state trajectory analysis for model type '%s'", args.model_type
         )
 
     LOGGER.info("Analysis complete. Artifacts saved to %s", out_dir)

@@ -39,8 +39,8 @@ LOGGER = get_logger(__name__)
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Offline training for STREAM")
     parser.add_argument("--data_dir", type=Path, default="/home/zj/code/STREAM/ml-10M100K")
-    parser.add_argument("--out_dir", type=Path, default="/home/zj/code/STREAM/ml-10M100K/causal")
-    parser.add_argument("--model_type", choices=["causal", "bert"], default="causal")
+    parser.add_argument("--out_dir", type=Path, default="/home/zj/code/STREAM/ml-10M100K/bert")
+    parser.add_argument("--model_type", choices=["causal", "bert"], default="bert")
     parser.add_argument("--pretrained_name_or_path", type=str, default="/home/zj/model/Llama-2-7b-hf")
     parser.add_argument(
         "--num_category_directions",
@@ -50,8 +50,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--router_k", type=int, default=16)
     parser.add_argument("--subspace_mode", choices=["gradcov", "pca"], default="gradcov")
-    parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument(
         "--grad_accumulation_steps",
         type=int,
@@ -64,7 +64,7 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Gradient clipping value (set <=0 to disable)",
     )
-    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument(
@@ -320,18 +320,26 @@ def build_router(model, dataloader, router_k: int, device) -> Dict:
     hidden_vectors = []
     for batch in dataloader:
         with torch.no_grad():
-            hidden = model.stream_hidden_states({k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()})
-        hidden_vectors.append(torch.nn.functional.normalize(hidden, dim=-1).cpu())
+            hidden = model.stream_hidden_states(
+                {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            )
+        hidden = torch.nn.functional.normalize(hidden.float(), dim=-1)
+        hidden_vectors.append(hidden.cpu())
+
         if len(hidden_vectors) * hidden.shape[0] > 5000:
             break
-    hidden_cat = torch.cat(hidden_vectors, dim=0)
+
+    hidden_cat = torch.cat(hidden_vectors, dim=0).to(torch.float32)
+
     if router_k <= 1 or hidden_cat.size(0) < router_k:
         centers = hidden_cat.mean(dim=0, keepdim=True)
     else:
         kmeans = KMeans(n_clusters=router_k, random_state=0, n_init=10)
-        kmeans.fit(hidden_cat.numpy())
+        kmeans.fit(hidden_cat.cpu().numpy())
         centers = torch.from_numpy(kmeans.cluster_centers_)
+
     return {"centers": centers}
+
 
 
 def load_item_text_map(data_dir: Path, item_vocab: ItemVocab) -> dict[int, str]:

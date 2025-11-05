@@ -44,6 +44,18 @@ class UserSegmentDistributions:
     late: Optional[np.ndarray]
 
 
+@dataclass
+class UserInteractionStats:
+    """Store interaction counts for each user segment."""
+
+    early: int
+    late: int
+
+    @property
+    def total(self) -> int:
+        return self.early + self.late
+
+
 def set_random_seeds(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -91,7 +103,12 @@ def compute_user_category_distributions(
     category_order: Sequence[str],
     *,
     max_users: Optional[int] = None,
-) -> Tuple[Dict[str, UserSegmentDistributions], List[str], Dict[str, Dict[str, Dict[str, float]]]]:
+) -> Tuple[
+    Dict[str, UserSegmentDistributions],
+    List[str],
+    Dict[str, Dict[str, Dict[str, float]]],
+    Dict[str, UserInteractionStats],
+]:
     """Compute per-user early and late category distributions."""
 
     categories = list(category_order)
@@ -100,7 +117,14 @@ def compute_user_category_distributions(
     early_counts: Dict[str, Counter] = defaultdict(Counter)
     late_counts: Dict[str, Counter] = defaultdict(Counter)
 
-    def _accumulate(records: Iterable[Mapping], dest: MutableMapping[str, Counter]) -> None:
+    early_interactions: Dict[str, int] = defaultdict(int)
+    late_interactions: Dict[str, int] = defaultdict(int)
+
+    def _accumulate(
+        records: Iterable[Mapping],
+        dest: MutableMapping[str, Counter],
+        interaction_dest: MutableMapping[str, int],
+    ) -> None:
         for rec in records:
             user_raw = rec.get("user")
             if user_raw is None:
@@ -110,6 +134,7 @@ def compute_user_category_distributions(
             if not items:
                 continue
             for item_idx in items:
+                interaction_dest[user_id] += 1
                 cats = category_map.get(int(item_idx), [])
                 if not cats:
                     continue
@@ -117,9 +142,9 @@ def compute_user_category_distributions(
                 for cat in cats:
                     dest[user_id][cat] += weight
 
-    _accumulate(splits.get("original", []), early_counts)
+    _accumulate(splits.get("original", []), early_counts, early_interactions)
     late_records = list(splits.get("finetune", [])) + list(splits.get("test", []))
-    _accumulate(late_records, late_counts)
+    _accumulate(late_records, late_counts, late_interactions)
 
     all_users = sorted(set(early_counts.keys()) | set(late_counts.keys()), key=lambda x: int(x))
     if max_users is not None:
@@ -127,6 +152,7 @@ def compute_user_category_distributions(
 
     user_distributions: Dict[str, UserSegmentDistributions] = {}
     user_prob_json: Dict[str, Dict[str, Dict[str, float]]] = {}
+    user_interaction_stats: Dict[str, UserInteractionStats] = {}
 
     for user_id in all_users:
         early_counter = early_counts.get(user_id, Counter())
@@ -148,8 +174,14 @@ def compute_user_category_distributions(
         late_vec, late_probs = _to_distribution(late_counter)
         user_distributions[user_id] = UserSegmentDistributions(early=early_vec, late=late_vec)
         user_prob_json[user_id] = {"early": early_probs, "late": late_probs}
+        early_interactions_count = early_interactions.get(user_id, 0)
+        late_interactions_count = late_interactions.get(user_id, 0)
+        user_interaction_stats[user_id] = UserInteractionStats(
+            early=early_interactions_count,
+            late=late_interactions_count,
+        )
 
-    return user_distributions, categories, user_prob_json
+    return user_distributions, categories, user_prob_json, user_interaction_stats
 
 
 def js_divergence(p: np.ndarray, q: np.ndarray, eps: float = 1e-12) -> float:
@@ -187,66 +219,293 @@ def compute_user_category_drift(
     return drift
 
 
+def _items_to_distribution(
+    items: Sequence[int],
+    category_map: Mapping[int, Sequence[str]],
+    category_order: Sequence[str],
+) -> Optional[np.ndarray]:
+    if not items:
+        return None
+    category_index = {cat: idx for idx, cat in enumerate(category_order)}
+    counts = np.zeros(len(category_order), dtype=np.float64)
+    total = 0.0
+    for item_idx in items:
+        cats = category_map.get(int(item_idx), [])
+        if not cats:
+            continue
+        weight = 1.0 / float(len(cats))
+        total += weight
+        for cat in cats:
+            idx = category_index.get(cat)
+            if idx is not None:
+                counts[idx] += weight
+    if total <= 0:
+        return None
+    return (counts / total).astype(np.float32)
+
+
+def compute_randomized_jsd(
+    user_interaction_stats: Mapping[str, UserInteractionStats],
+    original_sequences: Mapping[str, Sequence[int]],
+    finetune_sequences: Mapping[str, Sequence[int]],
+    test_sequences: Mapping[str, Sequence[int]],
+    category_map: Mapping[int, Sequence[str]],
+    category_order: Sequence[str],
+    *,
+    num_samples: int = 50,
+    seed: Optional[int] = None,
+) -> List[float]:
+    rng = np.random.default_rng(seed)
+    randomized_jsd: List[float] = []
+    for user_id, stats in user_interaction_stats.items():
+        early_len = stats.early
+        late_len = stats.late
+        if early_len <= 0 or late_len <= 0:
+            continue
+        combined = (
+            list(original_sequences.get(user_id, []))
+            + list(finetune_sequences.get(user_id, []))
+            + list(test_sequences.get(user_id, []))
+        )
+        if len(combined) < early_len + late_len:
+            continue
+        for _ in range(max(1, num_samples)):
+            shuffled = combined.copy()
+            rng.shuffle(shuffled)
+            early_items = shuffled[:early_len]
+            late_items = shuffled[early_len : early_len + late_len]
+            early_dist = _items_to_distribution(early_items, category_map, category_order)
+            late_dist = _items_to_distribution(late_items, category_map, category_order)
+            if early_dist is None or late_dist is None:
+                continue
+            randomized_jsd.append(js_divergence(early_dist, late_dist))
+    return randomized_jsd
+
+
+def summarize_jsd_statistics(
+    jsd_map: Mapping[str, float],
+    user_interaction_stats: Mapping[str, UserInteractionStats],
+    interaction_bins: Sequence[int],
+) -> Dict[str, Dict[str, float]]:
+    summary: Dict[str, Dict[str, float]] = {}
+    values = [val for val in jsd_map.values() if not math.isnan(val)]
+    if values:
+        summary["overall"] = {
+            "count": float(len(values)),
+            "mean": float(np.mean(values)),
+            "median": float(np.median(values)),
+            "p95": float(np.percentile(values, 95)),
+        }
+    thresholds = sorted(set(interaction_bins))
+    if 0 not in thresholds:
+        thresholds.insert(0, 0)
+    bins: List[Tuple[int, Optional[int]]] = []
+    for idx, lower in enumerate(thresholds):
+        upper: Optional[int]
+        if idx + 1 < len(thresholds):
+            upper = thresholds[idx + 1]
+        else:
+            upper = None
+        bins.append((lower, upper))
+    for lower, upper in bins:
+        label = f">={lower}" if upper is None else f"{lower}-{upper}"
+        bucket_values: List[float] = []
+        for user_id, stats in user_interaction_stats.items():
+            total = stats.total
+            if total < lower:
+                continue
+            if upper is not None and total >= upper:
+                continue
+            jsd_val = jsd_map.get(user_id)
+            if jsd_val is None or math.isnan(jsd_val):
+                continue
+            bucket_values.append(jsd_val)
+        if not bucket_values:
+            continue
+        summary[label] = {
+            "count": float(len(bucket_values)),
+            "mean": float(np.mean(bucket_values)),
+            "median": float(np.median(bucket_values)),
+            "p95": float(np.percentile(bucket_values, 95)),
+        }
+    return summary
+
+
 def save_json(data: Mapping, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, sort_keys=True)
 
 
-def plot_jsd_histogram(jsd_values: Sequence[float], out_path: Path, bins: int = 40) -> None:
+def plot_jsd_histograms(
+    jsd_map: Mapping[str, float],
+    randomized_jsd: Sequence[float],
+    user_interaction_stats: Mapping[str, UserInteractionStats],
+    out_path: Path,
+    *,
+    bins: int = 40,
+    interaction_bins: Sequence[int] = (),
+) -> None:
+    jsd_values = [val for val in jsd_map.values() if not math.isnan(val)]
     if not jsd_values:
         LOGGER.warning("No JSD values available for histogram plot")
         return
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.hist(jsd_values, bins=bins, color="tab:blue", alpha=0.75)
-    ax.set_xlabel("Jensen-Shannon divergence")
-    ax.set_ylabel("Number of users")
-    ax.set_title("Distribution of user category drift (JSD)")
+    thresholds = sorted(set(interaction_bins))
+    if thresholds and 0 not in thresholds:
+        thresholds.insert(0, 0)
+    bins: List[Tuple[int, Optional[int]]] = []
+    if thresholds:
+        for idx, lower in enumerate(thresholds):
+            upper: Optional[int]
+            if idx + 1 < len(thresholds):
+                upper = thresholds[idx + 1]
+            else:
+                upper = None
+            bins.append((lower, upper))
+    num_subplots = 1 + (len(bins) if bins else 0)
+    fig, axes = plt.subplots(num_subplots, 1, figsize=(8, 4 * num_subplots))
+    if not isinstance(axes, np.ndarray):
+        axes = np.array([axes])
+
+    overall_ax = axes[0]
+    density = True
+    overall_ax.hist(jsd_values, bins=bins, color="tab:blue", alpha=0.6, density=density, label="observed")
+    if randomized_jsd:
+        overall_ax.hist(
+            randomized_jsd,
+            bins=bins,
+            color="tab:orange",
+            alpha=0.45,
+            density=density,
+            label="time-shuffled baseline",
+        )
+    mean_val = float(np.mean(jsd_values))
+    median_val = float(np.median(jsd_values))
+    p95_val = float(np.percentile(jsd_values, 95))
+    for value, label, style in [
+        (mean_val, "mean", ("tab:red", "-")),
+        (median_val, "median", ("tab:green", "--")),
+        (p95_val, "95th pct", ("tab:purple", ":")),
+    ]:
+        overall_ax.axvline(value, color=style[0], linestyle=style[1], linewidth=1.5, label=label)
+    overall_ax.set_xlabel("Jensen-Shannon divergence")
+    overall_ax.set_ylabel("Density")
+    overall_ax.set_title("User category drift vs. randomized baseline")
+    overall_ax.legend(loc="upper right")
+
+    if bins:
+        for idx, (lower, upper) in enumerate(bins):
+            ax = axes[idx + 1]
+            label = f">={lower}" if upper is None else f"{lower}-{upper}"
+            values = []
+            for user_id, stats in user_interaction_stats.items():
+                total = stats.total
+                if total < lower:
+                    continue
+                if upper is not None and total >= upper:
+                    continue
+                jsd_val = jsd_map.get(user_id)
+                if jsd_val is None or math.isnan(jsd_val):
+                    continue
+                values.append(jsd_val)
+            if not values:
+                ax.set_visible(False)
+                continue
+            ax.hist(values, bins=bins, color="tab:blue", alpha=0.7)
+            ax.set_xlabel("Jensen-Shannon divergence")
+            ax.set_ylabel("Number of users")
+            ax.set_title(f"Users with total interactions in [{label})")
+
     fig.tight_layout()
     fig.savefig(out_path, dpi=200)
     plt.close(fig)
 
 
-def plot_top_drift_users_heatmap(
-    top_users: Sequence[str],
+def plot_user_category_heatmaps(
+    selected_users: Sequence[str],
     user_distributions: Mapping[str, UserSegmentDistributions],
     category_order: Sequence[str],
     out_path: Path,
     *,
     max_categories: int = 20,
+    title: str = "Category distributions",
 ) -> None:
-    if not top_users:
-        LOGGER.warning("No top drift users available for heatmap plot")
+    if not selected_users:
+        LOGGER.warning("No users available for heatmap plot")
         return
     num_categories = min(len(category_order), max_categories)
     categories = list(category_order[:num_categories])
     early_matrix: List[np.ndarray] = []
     late_matrix: List[np.ndarray] = []
-    for user_id in top_users:
+    valid_users: List[str] = []
+    for user_id in selected_users:
         dist = user_distributions.get(user_id)
         if not dist or dist.early is None or dist.late is None:
             continue
         early_matrix.append(dist.early[:num_categories])
         late_matrix.append(dist.late[:num_categories])
+        valid_users.append(user_id)
     if not early_matrix:
-        LOGGER.warning("No valid distributions for top drift users heatmap")
+        LOGGER.warning("No valid distributions for heatmap")
         return
     early_stack = np.stack(early_matrix, axis=0)
     late_stack = np.stack(late_matrix, axis=0)
 
-    fig, axes = plt.subplots(1, 2, figsize=(max(10, num_categories * 0.6), len(top_users) * 0.4 + 3), sharey=True)
-    for ax, data, title in zip(axes, [early_stack, late_stack], ["Early segment", "Late segment"]):
-        im = ax.imshow(data, aspect="auto", cmap="viridis")
+    fig_width = max(12, num_categories * 0.7)
+    fig_height = len(valid_users) * 0.45 + 3
+    fig, axes = plt.subplots(1, 3, figsize=(fig_width, fig_height), sharey=True)
+    matrices = [early_stack, late_stack, late_stack - early_stack]
+    titles = ["Early segment", "Late segment", "Late - Early"]
+    cmaps = ["viridis", "viridis", "coolwarm"]
+    for ax, data, subplot_title, cmap in zip(axes, matrices, titles, cmaps):
+        if subplot_title == "Late - Early":
+            vmax = np.percentile(np.abs(data), 98) if np.any(data) else 0.0
+            if vmax <= 0:
+                vmax = 0.1
+            im = ax.imshow(data, aspect="auto", cmap=cmap, vmin=-vmax, vmax=vmax)
+        else:
+            im = ax.imshow(data, aspect="auto", cmap=cmap)
         ax.set_xticks(range(num_categories))
         ax.set_xticklabels(categories, rotation=45, ha="right")
-        ax.set_yticks(range(len(top_users)))
-        ax.set_yticklabels(top_users)
-        ax.set_title(title)
+        ax.set_yticks(range(len(valid_users)))
+        ax.set_yticklabels(valid_users)
+        ax.set_title(subplot_title)
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    fig.suptitle("Category distributions for top drift users")
+    fig.suptitle(title)
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     fig.savefig(out_path, dpi=200)
     plt.close(fig)
+
+
+def select_users_by_jsd(
+    drift_metrics: Mapping[str, Mapping[str, float]],
+    user_interaction_stats: Mapping[str, UserInteractionStats],
+    *,
+    count: int,
+    strategy: str = "top",
+    min_total_interactions: int = 0,
+) -> List[str]:
+    if count <= 0:
+        return []
+    candidates: List[Tuple[str, float]] = []
+    for user_id, metrics in drift_metrics.items():
+        stats = user_interaction_stats.get(user_id)
+        if not stats or stats.total < min_total_interactions or stats.early <= 0 or stats.late <= 0:
+            continue
+        jsd_val = float(metrics.get("jsd", float("nan")))
+        if math.isnan(jsd_val):
+            continue
+        candidates.append((user_id, jsd_val))
+    if not candidates:
+        return []
+    if strategy == "top":
+        candidates.sort(key=lambda kv: kv[1], reverse=True)
+    elif strategy == "median":
+        median_val = float(np.median([val for _, val in candidates]))
+        candidates.sort(key=lambda kv: abs(kv[1] - median_val))
+    else:
+        raise ValueError(f"Unsupported strategy '{strategy}'")
+    return [user for user, _ in candidates[:count]]
 
 
 def build_user_probability_maps(
@@ -313,7 +572,29 @@ def compute_ranking_metrics(scores: torch.Tensor, target: int, ks: Sequence[int]
     return metrics
 
 
-def evaluate_metrics_per_bucket(
+def bootstrap_mean_ci(
+    values: np.ndarray,
+    *,
+    num_samples: int = 1000,
+    alpha: float = 0.05,
+    rng: Optional[np.random.Generator] = None,
+) -> Tuple[float, float]:
+    if values.size == 0:
+        return float("nan"), float("nan")
+    if values.size == 1:
+        val = float(values[0])
+        return val, val
+    generator = rng or np.random.default_rng()
+    means = np.empty(num_samples, dtype=np.float64)
+    for idx in range(num_samples):
+        sample_indices = generator.integers(0, values.size, size=values.size)
+        means[idx] = float(values[sample_indices].mean())
+    lower = float(np.percentile(means, 100 * (alpha / 2.0)))
+    upper = float(np.percentile(means, 100 * (1.0 - alpha / 2.0)))
+    return lower, upper
+
+
+def collect_sample_metrics(
     model,
     dataloader,
     user_prob_maps: Mapping[str, Mapping[str, Mapping[str, float]]],
@@ -326,9 +607,8 @@ def evaluate_metrics_per_bucket(
     early_threshold: float,
     drift_low_threshold: float,
     late_threshold: float,
-) -> Tuple[Dict[str, Dict[str, float]], Dict[str, int]]:
-    metrics_sum: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
-    counts: Dict[str, int] = defaultdict(int)
+) -> List[Dict[str, object]]:
+    results: List[Dict[str, object]] = []
 
     ptr = 0
     first_param = next(model.parameters())
@@ -362,20 +642,124 @@ def evaluate_metrics_per_bucket(
                 drift_low_threshold=drift_low_threshold,
                 late_threshold=late_threshold,
             )
-            if bucket is None:
-                continue
             metrics = compute_ranking_metrics(row, target_item, ks)
-            for name, value in metrics.items():
-                metrics_sum[bucket][name] += float(value)
-            counts[bucket] += 1
+            results.append(
+                {
+                    "user": user_id,
+                    "target_item": target_item,
+                    "metrics": metrics,
+                    "heuristic_bucket": bucket,
+                }
+            )
 
-    averaged: Dict[str, Dict[str, float]] = {}
-    for bucket, metric_map in metrics_sum.items():
-        bucket_count = counts.get(bucket, 0)
-        if bucket_count <= 0:
+    return results
+
+
+def aggregate_metrics_by_bucket(
+    samples: Sequence[Mapping[str, object]],
+    metrics_to_plot: Sequence[str],
+    bucket_getter,
+    *,
+    balance_users: bool = False,
+    bootstrap_samples: int = 1000,
+    seed: Optional[int] = None,
+    alpha: float = 0.05,
+) -> Tuple[
+    Dict[str, Dict[str, float]],
+    Dict[str, Dict[str, Tuple[float, float]]],
+    Dict[str, int],
+    Dict[str, int],
+]:
+    bucket_metric_user_values: Dict[str, Dict[str, Dict[str, List[float]]]] = defaultdict(
+        lambda: defaultdict(lambda: defaultdict(list))
+    )
+    bucket_user_sets: Dict[str, set[str]] = defaultdict(set)
+    bucket_sample_counts: Dict[str, int] = defaultdict(int)
+
+    for sample in samples:
+        bucket = bucket_getter(sample)
+        if bucket is None:
             continue
-        averaged[bucket] = {name: val / bucket_count for name, val in metric_map.items()}
-    return averaged, counts
+        user = str(sample.get("user"))
+        if not user:
+            continue
+        metrics_map = sample.get("metrics")
+        if not isinstance(metrics_map, dict):
+            continue
+        bucket_sample_counts[bucket] += 1
+        bucket_user_sets[bucket].add(user)
+        for metric_name, value in metrics_map.items():
+            bucket_metric_user_values[bucket][metric_name][user].append(float(value))
+
+    if not bucket_metric_user_values:
+        return {}, {}, {}, {}
+
+    rng = np.random.default_rng(seed)
+    user_counts = {bucket: len(users) for bucket, users in bucket_user_sets.items()}
+    min_user_count = (
+        min((count for count in user_counts.values() if count > 0)) if balance_users and user_counts else None
+    )
+
+    mean_metrics: Dict[str, Dict[str, float]] = {}
+    ci_metrics: Dict[str, Dict[str, Tuple[float, float]]] = {}
+
+    for bucket, metric_map in bucket_metric_user_values.items():
+        mean_metrics[bucket] = {}
+        ci_metrics[bucket] = {}
+        for metric_name in metrics_to_plot:
+            user_values = metric_map.get(metric_name)
+            if not user_values:
+                continue
+            per_user_means = np.array(
+                [np.mean(values) for values in user_values.values()], dtype=np.float64
+            )
+            if per_user_means.size == 0:
+                continue
+            if min_user_count is not None and per_user_means.size > min_user_count:
+                indices = rng.choice(per_user_means.size, size=min_user_count, replace=False)
+                per_user_means = per_user_means[indices]
+            mean_metrics[bucket][metric_name] = float(per_user_means.mean())
+            lower, upper = bootstrap_mean_ci(
+                per_user_means,
+                num_samples=bootstrap_samples,
+                alpha=alpha,
+                rng=rng,
+            )
+            ci_metrics[bucket][metric_name] = (lower, upper)
+
+    return mean_metrics, ci_metrics, user_counts, dict(bucket_sample_counts)
+
+
+def assign_jsd_quantile_buckets(
+    drift_metrics: Mapping[str, Mapping[str, float]],
+    *,
+    num_bins: int,
+) -> Tuple[Dict[str, str], List[float], List[str]]:
+    if num_bins <= 0:
+        raise ValueError("num_bins must be positive")
+    jsd_entries: List[Tuple[str, float]] = []
+    for user_id, metrics in drift_metrics.items():
+        jsd_val = float(metrics.get("jsd", float("nan")))
+        if math.isnan(jsd_val):
+            continue
+        jsd_entries.append((user_id, jsd_val))
+    if not jsd_entries:
+        return {}, [], []
+    values = np.array([val for _, val in jsd_entries], dtype=np.float64)
+    quantiles = np.linspace(0.0, 1.0, num_bins + 1)
+    edges = np.quantile(values, quantiles)
+    edges[0] = float(values.min())
+    edges[-1] = float(values.max())
+    for idx in range(1, len(edges)):
+        if edges[idx] <= edges[idx - 1]:
+            edges[idx] = edges[idx - 1] + 1e-6
+    labels = [f"Q{i + 1} [{edges[i]:.3f}, {edges[i + 1]:.3f}]" for i in range(num_bins)]
+    user_buckets: Dict[str, str] = {}
+    for user_id, jsd_val in jsd_entries:
+        bucket_idx = int(np.searchsorted(edges, jsd_val, side="right") - 1)
+        bucket_idx = min(max(bucket_idx, 0), num_bins - 1)
+        user_buckets[user_id] = labels[bucket_idx]
+    return user_buckets, edges.tolist(), labels
 
 
 def build_sample_metadata(
@@ -410,28 +794,51 @@ def build_sample_metadata(
 
 def plot_bucket_metrics(
     metrics: Mapping[str, Mapping[str, float]],
-    counts: Mapping[str, int],
+    user_counts: Mapping[str, int],
     out_path: Path,
     *,
     metrics_to_plot: Sequence[str],
+    ci: Optional[Mapping[str, Mapping[str, Tuple[float, float]]]] = None,
+    sample_counts: Optional[Mapping[str, int]] = None,
 ) -> None:
     if not metrics:
         LOGGER.warning("No metrics available for bucket comparison plot")
         return
     buckets = sorted(metrics.keys())
-    fig, axes = plt.subplots(len(metrics_to_plot), 1, figsize=(6, 4 * len(metrics_to_plot)))
+    fig, axes = plt.subplots(len(metrics_to_plot), 1, figsize=(7, 4 * len(metrics_to_plot)))
     if not isinstance(axes, np.ndarray):
         axes = np.array([axes])
+    colors = plt.cm.tab10.colors
     for ax, metric_name in zip(axes, metrics_to_plot):
         values = [metrics[bucket].get(metric_name, 0.0) for bucket in buckets]
-        colors = ["tab:blue", "tab:orange", "tab:green", "tab:red"]
-        ax.bar(buckets, values, color=colors[: len(buckets)])
+        bars = ax.bar(range(len(buckets)), values, color=[colors[idx % len(colors)] for idx in range(len(buckets))])
+        ax.set_xticks(range(len(buckets)))
+        ax.set_xticklabels(buckets)
         ax.set_ylabel(metric_name)
-        ax.set_ylim(0.0, max(values + [0.01]) * 1.1)
-        count_labels = [f"n={counts.get(bucket, 0)}" for bucket in buckets]
-        for idx, (bucket, value, label) in enumerate(zip(buckets, values, count_labels)):
-            ax.text(idx, value + 1e-3, label, ha="center", va="bottom", fontsize=10)
-        ax.set_title(f"{metric_name} by drift bucket")
+        ylim_top = max(values + [0.01]) * 1.1
+        ax.set_ylim(0.0, ylim_top)
+        for idx, bucket in enumerate(buckets):
+            label_parts = [f"users={user_counts.get(bucket, 0)}"]
+            if sample_counts:
+                label_parts.append(f"samples={sample_counts.get(bucket, 0)}")
+            label = ", ".join(label_parts)
+            ax.text(idx, values[idx] + ylim_top * 0.02, label, ha="center", va="bottom", fontsize=10)
+            if ci:
+                interval = ci.get(bucket, {}).get(metric_name)
+                if interval:
+                    lower, upper = interval
+                    if not math.isnan(lower) and not math.isnan(upper):
+                        err = np.array([[values[idx] - lower], [upper - values[idx]]])
+                        ax.errorbar(
+                            idx,
+                            values[idx],
+                            yerr=err,
+                            fmt="none",
+                            ecolor="black",
+                            elinewidth=1.2,
+                            capsize=4,
+                        )
+        ax.set_title(f"{metric_name} by bucket")
     axes[-1].set_xlabel("Bucket")
     fig.tight_layout()
     fig.savefig(out_path, dpi=200)
@@ -656,8 +1063,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_users", type=int, default=None, help="Limit analysis to the first N users")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--hist_bins", type=int, default=40, help="Number of bins for JSD histogram")
+    parser.add_argument(
+        "--interaction_bins",
+        type=int,
+        nargs="*",
+        default=[0, 20, 50, 100],
+        help="Interaction count thresholds used to stratify JSD histograms",
+    )
     parser.add_argument("--top_k_users", type=int, default=20, help="Number of top drift users to visualize")
+    parser.add_argument(
+        "--median_k_users",
+        type=int,
+        default=10,
+        help="Number of median-drift users to visualize",
+    )
     parser.add_argument("--heatmap_categories", type=int, default=20, help="Maximum categories in heatmap plot")
+    parser.add_argument(
+        "--heatmap_min_interactions",
+        type=int,
+        default=20,
+        help="Minimum total interactions required for heatmap visualizations",
+    )
+    parser.add_argument(
+        "--random_baseline_samples",
+        type=int,
+        default=50,
+        help="Number of shuffles per user when building the randomized JSD baseline",
+    )
     parser.add_argument("--eval_batch_size", type=int, default=32, help="Batch size for evaluation")
     parser.add_argument("--num_workers", type=int, default=0, help="Number of DataLoader workers")
     parser.add_argument("--device", type=str, default=None, help="Device for model execution (e.g. cuda)")
@@ -674,6 +1106,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--drift_late_threshold", type=float, default=0.2, help="Minimum late probability for drift classification")
     parser.add_argument("--metric_ks", type=int, nargs="*", default=[5, 10, 20], help="Ranking cutoffs")
     parser.add_argument("--metrics_plot", type=str, nargs="*", default=["ndcg@10", "recall@20"], help="Metrics to visualise in bar plot")
+    parser.add_argument(
+        "--jsd_quantile_bins",
+        type=int,
+        default=4,
+        help="Number of quantile buckets for JSD-based metric analysis",
+    )
+    parser.add_argument(
+        "--balance_bucket_users",
+        action="store_true",
+        help="Balance buckets by downsampling to the same number of users before averaging metrics",
+    )
+    parser.add_argument(
+        "--metric_bootstrap_samples",
+        type=int,
+        default=500,
+        help="Number of bootstrap resamples for confidence intervals",
+    )
     parser.add_argument("--subspace_rank", type=int, default=8, help="Number of semantic directions to extract")
     parser.add_argument("--subspace_batch_size", type=int, default=32, help="Batch size when computing subspace")
     parser.add_argument("--min_category_samples", type=int, default=20, help="Minimum samples per category for subspace")
@@ -700,7 +1149,12 @@ def main() -> None:
     if args.max_users is not None:
         LOGGER.info("Restricting analysis to first %d users", args.max_users)
 
-    user_distributions, ordered_categories, user_prob_json = compute_user_category_distributions(
+    (
+        user_distributions,
+        ordered_categories,
+        user_prob_json,
+        user_interaction_stats,
+    ) = compute_user_category_distributions(
         splits,
         category_map,
         category_order,
@@ -714,23 +1168,82 @@ def main() -> None:
         filtered_splits[split_name] = filter_records_by_users(records, allowed_users if allowed_users else None)
     splits = filtered_splits
 
+    original_records = splits.get("original", [])
+    finetune_records = splits.get("finetune", [])
+    test_records = splits.get("test", [])
+    original_sequences = gather_user_sequences(original_records)
+    finetune_sequences = gather_user_sequences(finetune_records)
+    test_sequences = gather_user_sequences(test_records)
+
     save_json(
         {"category_order": ordered_categories, "users": user_prob_json},
         out_dir / "user_category_distributions.json",
     )
     save_json(drift_metrics, out_dir / "user_category_drift.json")
 
-    jsd_values = [metrics["jsd"] for metrics in drift_metrics.values() if not math.isnan(metrics["jsd"])]
-    plot_jsd_histogram(jsd_values, out_dir / "jsd_hist.png", bins=args.hist_bins)
-
-    top_users = [user for user, _ in sorted(drift_metrics.items(), key=lambda kv: kv[1]["jsd"], reverse=True)[: args.top_k_users]]
-    plot_top_drift_users_heatmap(
-        top_users,
-        user_distributions,
+    jsd_map = {
+        user_id: metrics["jsd"]
+        for user_id, metrics in drift_metrics.items()
+        if not math.isnan(metrics.get("jsd", float("nan")))
+    }
+    randomized_jsd = compute_randomized_jsd(
+        user_interaction_stats,
+        original_sequences,
+        finetune_sequences,
+        test_sequences,
+        category_map,
         ordered_categories,
-        out_dir / "top_drift_users_categories.png",
-        max_categories=args.heatmap_categories,
+        num_samples=args.random_baseline_samples,
+        seed=args.seed,
     )
+    plot_jsd_histograms(
+        jsd_map,
+        randomized_jsd,
+        user_interaction_stats,
+        out_dir / "jsd_hist.png",
+        bins=args.hist_bins,
+        interaction_bins=args.interaction_bins,
+    )
+    jsd_summary = summarize_jsd_statistics(jsd_map, user_interaction_stats, args.interaction_bins)
+    save_json(jsd_summary, out_dir / "jsd_summary.json")
+
+    top_users = select_users_by_jsd(
+        drift_metrics,
+        user_interaction_stats,
+        count=args.top_k_users,
+        strategy="top",
+        min_total_interactions=args.heatmap_min_interactions,
+    )
+    if top_users:
+        plot_user_category_heatmaps(
+            top_users,
+            user_distributions,
+            ordered_categories,
+            out_dir / "top_drift_users_categories.png",
+            max_categories=args.heatmap_categories,
+            title="Top drift users (JSD)",
+        )
+    else:
+        LOGGER.warning("No users met the criteria for top-drift heatmap")
+
+    median_users = select_users_by_jsd(
+        drift_metrics,
+        user_interaction_stats,
+        count=args.median_k_users,
+        strategy="median",
+        min_total_interactions=args.heatmap_min_interactions,
+    )
+    if median_users:
+        plot_user_category_heatmaps(
+            median_users,
+            user_distributions,
+            ordered_categories,
+            out_dir / "median_drift_users_categories.png",
+            max_categories=args.heatmap_categories,
+            title="Median drift users (JSD)",
+        )
+    else:
+        LOGGER.warning("No users met the criteria for median-drift heatmap")
 
     LOGGER.info("Loading trained STREAM model (%s) from %s", args.model_type, model_dir)
     hf_model_dir = _resolve_hf_model_dir(model_dir)
@@ -776,7 +1289,7 @@ def main() -> None:
         )
 
     user_prob_maps = build_user_probability_maps(user_prob_json)
-    bucket_metrics, bucket_counts = evaluate_metrics_per_bucket(
+    sample_results = collect_sample_metrics(
         model,
         dataloader_test,
         user_prob_maps,
@@ -789,9 +1302,86 @@ def main() -> None:
         drift_low_threshold=args.drift_low_threshold,
         late_threshold=args.drift_late_threshold,
     )
-    save_json(bucket_metrics, out_dir / "drift_vs_non_drift_metrics.json")
-    save_json(bucket_counts, out_dir / "drift_vs_non_drift_counts.json")
-    plot_bucket_metrics(bucket_metrics, bucket_counts, out_dir / "drift_vs_non_drift_metrics.png", metrics_to_plot=args.metrics_plot)
+
+    heuristic_means, heuristic_ci, heuristic_user_counts, heuristic_sample_counts = aggregate_metrics_by_bucket(
+        sample_results,
+        args.metrics_plot,
+        lambda sample: sample.get("heuristic_bucket"),
+        balance_users=args.balance_bucket_users,
+        bootstrap_samples=args.metric_bootstrap_samples,
+        seed=args.seed,
+    )
+
+    def _format_ci(ci_dict: Mapping[str, Mapping[str, Tuple[float, float]]]) -> Dict[str, Dict[str, List[float]]]:
+        formatted: Dict[str, Dict[str, List[float]]] = {}
+        for bucket, metric_map in ci_dict.items():
+            formatted[bucket] = {
+                metric_name: [float(interval[0]), float(interval[1])] for metric_name, interval in metric_map.items()
+            }
+        return formatted
+
+    if heuristic_means:
+        save_json(
+            {
+                "means": heuristic_means,
+                "confidence_intervals": _format_ci(heuristic_ci),
+                "user_counts": heuristic_user_counts,
+                "sample_counts": heuristic_sample_counts,
+            },
+            out_dir / "drift_vs_non_drift_metrics.json",
+        )
+        save_json(
+            {
+                "users": heuristic_user_counts,
+                "samples": heuristic_sample_counts,
+            },
+            out_dir / "drift_vs_non_drift_counts.json",
+        )
+        plot_bucket_metrics(
+            heuristic_means,
+            heuristic_user_counts,
+            out_dir / "drift_vs_non_drift_metrics.png",
+            metrics_to_plot=args.metrics_plot,
+            ci=heuristic_ci,
+            sample_counts=heuristic_sample_counts,
+        )
+    else:
+        LOGGER.warning("No samples assigned to heuristic drift buckets")
+
+    user_quantile_buckets, quantile_edges, quantile_labels = assign_jsd_quantile_buckets(
+        drift_metrics,
+        num_bins=args.jsd_quantile_bins,
+    )
+    quantile_means, quantile_ci, quantile_user_counts, quantile_sample_counts = aggregate_metrics_by_bucket(
+        sample_results,
+        args.metrics_plot,
+        lambda sample: user_quantile_buckets.get(str(sample.get("user"))),
+        balance_users=args.balance_bucket_users,
+        bootstrap_samples=args.metric_bootstrap_samples,
+        seed=args.seed,
+    )
+    if quantile_means:
+        save_json(
+            {
+                "means": quantile_means,
+                "confidence_intervals": _format_ci(quantile_ci),
+                "user_counts": quantile_user_counts,
+                "sample_counts": quantile_sample_counts,
+                "quantile_edges": quantile_edges,
+                "labels": quantile_labels,
+            },
+            out_dir / "jsd_quantile_metrics.json",
+        )
+        plot_bucket_metrics(
+            quantile_means,
+            quantile_user_counts,
+            out_dir / "jsd_quantile_metrics.png",
+            metrics_to_plot=args.metrics_plot,
+            ci=quantile_ci,
+            sample_counts=quantile_sample_counts,
+        )
+    else:
+        LOGGER.warning("Unable to compute JSD quantile bucket metrics")
 
     LOGGER.info("Computing category semantic subspace")
     original_records = splits.get("original", [])

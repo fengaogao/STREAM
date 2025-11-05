@@ -96,8 +96,8 @@ class CausalLMDataset(Dataset):
         records: Sequence[Dict],
         tokenizer,
         item_vocab: ItemVocab,
-        max_history: int = 50,
-        max_length: int = 128,
+        max_history: int = 15,
+        max_length: int = 256,
         item_text_map: Dict[int, str] | None = None,
         *,
         pretokenize: bool = False,
@@ -228,10 +228,16 @@ class CausalLMDataset(Dataset):
         history_items = items[start_idx:target_pos]
         target_item = items[target_pos]
         history_tokens = [self._history_entry(i) for i in history_items]
-        prompt = "User {} History: {} Next?".format(
-            user,
-            " ; ".join(history_tokens) if history_tokens else "<none>",
+        prompt = (
+                f"The following are movies that user {user} has recently watched and enjoyed:\n"
+                + "\n".join(
+            f"{ht}" for ht in history_tokens
         )
+                + "\n\nBased on this watching pattern and genre preferences, "
+                  "please predict the next movie the user will most likely enjoy.\n"
+                  "Answer with the next item token only."
+        )
+
         encoded = self.tokenizer(
             prompt,
             add_special_tokens=True,

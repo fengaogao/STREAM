@@ -6,7 +6,9 @@ import json
 import math
 import os
 import pickle
+import gzip
 from collections import Counter
+from functools import lru_cache
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -342,6 +344,209 @@ def build_router(model, dataloader, router_k: int, device) -> Dict:
 
 
 
+def _load_item_id_mapping(data_dir: Path) -> Dict[str, int]:
+    mapping: Dict[str, int] = {}
+    meta_path = data_dir / "item_ids.json"
+    if not meta_path.exists():
+        return mapping
+
+    try:
+        with meta_path.open("r", encoding="utf-8") as f:
+            meta = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return mapping
+
+    mid2idx = meta.get("mid2idx", {}) if isinstance(meta, dict) else {}
+    for raw_id, raw_idx in mid2idx.items():
+        try:
+            idx = int(raw_idx)
+        except (TypeError, ValueError):
+            continue
+        key = str(raw_id).strip()
+        if not key:
+            continue
+        mapping[key] = idx
+        lower = key.lower()
+        upper = key.upper()
+        mapping.setdefault(lower, idx)
+        mapping.setdefault(upper, idx)
+        if key.isdigit():
+            mapping.setdefault(str(int(key)), idx)
+    return mapping
+
+
+def _clean_text(value: str, *, max_length: int = 512) -> str:
+    text = " ".join(str(value).split())
+    if max_length > 0 and len(text) > max_length:
+        text = text[: max_length - 3].rstrip() + "..."
+    return text
+
+
+def _extract_amazon_categories(entry: Dict) -> List[str]:
+    categories: set[str] = set()
+    raw_categories = entry.get("categories")
+    if isinstance(raw_categories, list):
+        for item in raw_categories:
+            if isinstance(item, list) and item:
+                leaf = str(item[-1]).strip()
+                if leaf:
+                    categories.add(leaf)
+            elif isinstance(item, str):
+                cleaned = item.strip()
+                if cleaned:
+                    categories.add(cleaned)
+    single = entry.get("category") or entry.get("main_cat")
+    if isinstance(single, str):
+        cleaned = single.strip()
+        if cleaned:
+            categories.add(cleaned)
+    return sorted(categories)
+
+
+def _iter_amazon_metadata_file(path: Path):
+    open_fn = gzip.open if path.suffix.endswith("gz") else open
+    try:
+        with open_fn(path, "rt", encoding="utf-8") as f:
+            prefix = f.read(1)
+            while prefix and prefix.isspace():
+                prefix = f.read(1)
+            f.seek(0)
+            if prefix == "[":
+                try:
+                    data = json.load(f)
+                except json.JSONDecodeError:
+                    return
+                if isinstance(data, list):
+                    for entry in data:
+                        if isinstance(entry, dict):
+                            yield entry
+                return
+            for line in f:
+                line = line.strip().rstrip(",")
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(entry, dict):
+                    yield entry
+    except OSError:
+        return
+
+
+@lru_cache(maxsize=8)
+def _load_amazon_metadata_cached(data_dir_str: str) -> Tuple[Dict[int, str], Dict[int, List[str]]]:
+    data_dir = Path(data_dir_str)
+    id_mapping = _load_item_id_mapping(data_dir)
+    if not id_mapping:
+        return {}, {}
+
+    meta_files: List[Path] = []
+    patterns = [
+        "meta_*.json",
+        "meta_*.jsonl",
+        "meta_*.json.gz",
+        "meta_*.jsonl.gz",
+        "item_meta.json",
+        "item_meta.jsonl",
+        "item_meta.json.gz",
+        "item_meta.jsonl.gz",
+        "metadata.json",
+        "metadata.jsonl",
+        "metadata.json.gz",
+        "metadata.jsonl.gz",
+    ]
+    for pattern in patterns:
+        meta_files.extend(sorted(data_dir.glob(pattern)))
+
+    seen: set[Path] = set()
+    unique_files: List[Path] = []
+    for path in meta_files:
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique_files.append(path)
+
+    text_map: Dict[int, str] = {}
+    category_map: Dict[int, List[str]] = {}
+
+    for meta_path in unique_files:
+        for entry in _iter_amazon_metadata_file(meta_path):
+            raw_id = entry.get("asin") or entry.get("item_id") or entry.get("itemID") or entry.get("id")
+            if not raw_id:
+                continue
+            key = str(raw_id).strip()
+            if not key:
+                continue
+            idx = id_mapping.get(key) or id_mapping.get(key.lower()) or id_mapping.get(key.upper())
+            if idx is None and key.isdigit():
+                idx = id_mapping.get(str(int(key)))
+            if idx is None:
+                continue
+
+            categories = _extract_amazon_categories(entry)
+            if categories:
+                category_map[idx] = categories
+
+            parts: List[str] = []
+            title = entry.get("title") or entry.get("Title")
+            if isinstance(title, str) and title.strip():
+                parts.append(_clean_text(title, max_length=256))
+            brand = entry.get("brand")
+            if isinstance(brand, str) and brand.strip():
+                parts.append(f"Brand: {_clean_text(brand, max_length=128)}")
+            price = entry.get("price")
+            if isinstance(price, (int, float)):
+                parts.append(f"Price: {price}")
+            elif isinstance(price, str) and price.strip():
+                parts.append(f"Price: {_clean_text(price, max_length=64)}")
+
+            features = entry.get("feature") or entry.get("features")
+            feature_text = ""
+            if isinstance(features, list):
+                feature_items = [
+                    _clean_text(str(f), max_length=128)
+                    for f in features
+                    if isinstance(f, (str, int, float)) and str(f).strip()
+                ]
+                if feature_items:
+                    feature_text = "; ".join(feature_items[:5])
+            elif isinstance(features, str) and features.strip():
+                feature_text = _clean_text(features, max_length=256)
+            if feature_text:
+                parts.append(f"Features: {feature_text}")
+
+            description = entry.get("description")
+            desc_text = ""
+            if isinstance(description, list):
+                desc_items = [
+                    _clean_text(str(d), max_length=256)
+                    for d in description
+                    if isinstance(d, (str, int, float)) and str(d).strip()
+                ]
+                if desc_items:
+                    desc_text = " ".join(desc_items)
+            elif isinstance(description, str) and description.strip():
+                desc_text = _clean_text(description, max_length=512)
+            if desc_text:
+                parts.append(desc_text)
+
+            if categories:
+                parts.append("Categories: " + ", ".join(categories))
+
+            combined = " | ".join(p for p in parts if p)
+            if combined:
+                text_map[idx] = combined
+
+    return text_map, category_map
+
+
+def _load_amazon_metadata(data_dir: Path) -> Tuple[Dict[int, str], Dict[int, List[str]]]:
+    return _load_amazon_metadata_cached(str(data_dir.resolve()))
+
+
 def load_item_text_map(data_dir: Path, item_vocab: ItemVocab) -> dict[int, str]:
     text_map: dict[int, str] = {}
 
@@ -355,23 +560,27 @@ def load_item_text_map(data_dir: Path, item_vocab: ItemVocab) -> dict[int, str]:
         text_map[idx] = _fallback_name(idx)
 
     item_text_path = data_dir / "item_text.json"
-    if not item_text_path.exists():
+    if item_text_path.exists():
+        with item_text_path.open("r", encoding="utf-8") as f:
+            item_text = json.load(f)
+
+        for idx_str, raw_text in item_text.items():
+            try:
+                item_idx = int(idx_str)
+            except ValueError:
+                continue
+            if not (0 <= item_idx < item_vocab.num_items):
+                continue
+            cleaned = str(raw_text).strip()
+            if cleaned:
+                text_map[item_idx] = cleaned.replace(" | ", "; ")
+    else:
         LOGGER.warning("Item text metadata not found at %s", item_text_path)
-        return text_map
 
-    with item_text_path.open("r", encoding="utf-8") as f:
-        item_text = json.load(f)
-
-    for idx_str, raw_text in item_text.items():
-        try:
-            item_idx = int(idx_str)
-        except ValueError:
-            continue
-        if not (0 <= item_idx < item_vocab.num_items):
-            continue
-        cleaned = str(raw_text).strip()
-        if cleaned:
-            text_map[item_idx] = cleaned.replace(" | ", "; ")
+    amazon_text, _ = _load_amazon_metadata(data_dir)
+    for idx, text in amazon_text.items():
+        if 0 <= idx < item_vocab.num_items and text:
+            text_map[idx] = text
 
     return text_map
 
@@ -384,12 +593,24 @@ def load_item_categories(
     category_map: Dict[int, List[str]] = {i: [] for i in range(item_vocab.num_items)}
     category_counter: Counter[str] = Counter()
 
+    _, amazon_categories = _load_amazon_metadata(data_dir)
+    if amazon_categories:
+        for item_idx, cats in amazon_categories.items():
+            if not (0 <= item_idx < item_vocab.num_items):
+                continue
+            cleaned = [c for c in cats if c]
+            if cleaned:
+                category_map[item_idx] = cleaned
+                category_counter.update(cleaned)
+
     if item_text_map is None:
         item_text_map = load_item_text_map(data_dir, item_vocab)
 
     marker = "Genres:"
     for item_idx, text in item_text_map.items():
         if not (0 <= item_idx < item_vocab.num_items):
+            continue
+        if category_map[item_idx]:
             continue
         categories: List[str] = []
         if text and marker in text:

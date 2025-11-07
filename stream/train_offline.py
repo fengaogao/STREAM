@@ -606,18 +606,34 @@ def load_item_categories(
     if item_text_map is None:
         item_text_map = load_item_text_map(data_dir, item_vocab)
 
-    marker = "Genres:"
+    markers = ("Genres:", "Categories:", "Category:")
+    separators = (";", "|")
     for item_idx, text in item_text_map.items():
         if not (0 <= item_idx < item_vocab.num_items):
             continue
         if category_map[item_idx]:
             continue
+        if not text:
+            continue
+
         categories: List[str] = []
-        if text and marker in text:
-            raw = text.split(marker, 1)[1]
-            categories = [c.strip() for c in raw.split(",") if c.strip()]
-        category_map[item_idx] = categories
-        category_counter.update(categories)
+        lower_text = text
+        for marker in markers:
+            if marker not in lower_text:
+                continue
+            raw = lower_text.split(marker, 1)[1]
+            for sep in separators:
+                if sep in raw:
+                    raw = raw.split(sep, 1)[0]
+                    break
+            parts = [c.strip() for c in raw.split(",") if c.strip()]
+            if parts:
+                categories = parts
+                break
+
+        if categories:
+            category_map[item_idx] = categories
+            category_counter.update(categories)
 
     ordered_categories = [cat for cat, _ in category_counter.most_common()]
     return category_map, ordered_categories

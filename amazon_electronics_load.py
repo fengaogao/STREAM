@@ -108,25 +108,73 @@ def load_ratings(amz_root: str) -> pd.DataFrame:
 
 def _extract_categories_from_meta(obj) -> List[str]:
     """
-    从 meta_Electronics.json 的 "categories" 字段抽取类别。
-    常见格式：categories: [["Electronics","Computers & Accessories","Laptops"]]
-    策略：
-      - 取第一条路径，去掉根 "Electronics"，保留后续前2级；若无则返回 ['_UNK_']。
+    从 meta_Electronics.json 中抽取类别信息。
+
+    数据集中出现过以下几种字段/格式：
+      * "categories": [["Electronics", "Camera & Photo", ...], ...]
+      * "categories": ["Electronics > Camera & Photo > ..."]
+      * "category": ["Electronics", "Camera & Photo", ...]
+      * "category": "Electronics > Camera & Photo"
+      * "main_cat": "Electronics"
+
+    逻辑：选择第一条有效的类别路径，去掉根节点 "Electronics"，保留后续最多两级，若均缺失则返回
+    ['_UNK_']。
     """
-    cats = obj.get('categories', None)
-    path = None
+
+    def _split_category_string(value: str) -> List[str]:
+        text = str(value).strip()
+        if not text:
+            return []
+        for sep in ('>', '|', '›', '/', '\\'):
+            if sep in text:
+                parts = [p.strip() for p in text.split(sep) if p.strip()]
+                if parts:
+                    return parts
+        return [text]
+
+    def _normalise_path(raw_path) -> List[str]:
+        if isinstance(raw_path, list):
+            parts = [str(x).strip() for x in raw_path if str(x).strip()]
+            return parts
+        if isinstance(raw_path, str):
+            return _split_category_string(raw_path)
+        return []
+
+    candidates: List[List[str]] = []
+    cats = obj.get('categories')
     if isinstance(cats, list) and cats:
-        first = cats[0]
-        if isinstance(first, list):
-            path = [str(x).strip() for x in first if str(x).strip()]
+        for entry in cats:
+            path = _normalise_path(entry)
+            if path:
+                candidates.append(path)
+    elif isinstance(cats, str):
+        path = _normalise_path(cats)
+        if path:
+            candidates.append(path)
+
+    single = obj.get('category')
+    if single is not None:
+        path = _normalise_path(single)
+        if path:
+            candidates.append(path)
+
+    main_cat = obj.get('main_cat')
+    if isinstance(main_cat, str) and main_cat.strip():
+        candidates.append([main_cat.strip()])
+
+    path: List[str] = []
+    for candidate in candidates:
+        trimmed = [p for p in candidate if p]
+        while trimmed and trimmed[0].lower() == 'electronics':
+            trimmed = trimmed[1:]
+        if trimmed:
+            path = trimmed
+            break
+
     if not path:
         return ['_UNK_']
-    # 去掉根 "Electronics"
-    if path and path[0].lower() == 'electronics':
-        path = path[1:]
-    # 只保留前 2 级，避免过细导致稀疏
-    if len(path) >= 2:
-        return path[:2]
+
+    path = path[:2] if len(path) > 2 else path
     return path if path else ['_UNK_']
 
 def load_items(amz_root: str) -> pd.DataFrame:

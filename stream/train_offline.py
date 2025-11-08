@@ -383,24 +383,73 @@ def _clean_text(value: str, *, max_length: int = 512) -> str:
 
 
 def _extract_amazon_categories(entry: Dict) -> List[str]:
-    categories: set[str] = set()
+    """Normalise category information from heterogeneous Amazon metadata."""
+
+    def _split_category_string(value: str) -> List[str]:
+        text = str(value).strip()
+        if not text:
+            return []
+        for sep in ('>', '|', '›', '/', '\\'):
+            if sep in text:
+                parts = [p.strip() for p in text.split(sep) if p.strip()]
+                if parts:
+                    return parts
+        return [text]
+
+    def _normalise_path(raw_path) -> List[str]:
+        if isinstance(raw_path, list):
+            if all(isinstance(x, (str, int, float)) for x in raw_path):
+                return [str(x).strip() for x in raw_path if str(x).strip()]
+            parts: List[str] = []
+            for item in raw_path:
+                parts.extend(_normalise_path(item))
+            return parts
+        if isinstance(raw_path, str):
+            return _split_category_string(raw_path)
+        return []
+
+    candidates: List[List[str]] = []
     raw_categories = entry.get("categories")
-    if isinstance(raw_categories, list):
+    if isinstance(raw_categories, list) and raw_categories:
         for item in raw_categories:
-            if isinstance(item, list) and item:
-                leaf = str(item[-1]).strip()
-                if leaf:
-                    categories.add(leaf)
-            elif isinstance(item, str):
-                cleaned = item.strip()
-                if cleaned:
-                    categories.add(cleaned)
-    single = entry.get("category") or entry.get("main_cat")
-    if isinstance(single, str):
-        cleaned = single.strip()
-        if cleaned:
-            categories.add(cleaned)
-    return sorted(categories)
+            path = _normalise_path(item)
+            if path:
+                candidates.append(path)
+    elif isinstance(raw_categories, str):
+        path = _normalise_path(raw_categories)
+        if path:
+            candidates.append(path)
+
+    single = entry.get("category")
+    if single is not None:
+        path = _normalise_path(single)
+        if path:
+            candidates.append(path)
+
+    main_cat = entry.get("main_cat")
+    if isinstance(main_cat, str) and main_cat.strip():
+        candidates.append([main_cat.strip()])
+
+    categories: List[str] = []
+    seen: set[str] = set()
+
+    for path in candidates:
+        trimmed = [p for p in path if p]
+        while trimmed and trimmed[0].lower() == "electronics":
+            trimmed = trimmed[1:]
+        if not trimmed:
+            continue
+        trimmed = trimmed[:2] if len(trimmed) > 2 else trimmed
+        for cat in trimmed:
+            if cat not in seen:
+                categories.append(cat)
+                seen.add(cat)
+
+    if not categories and isinstance(main_cat, str) and main_cat.strip():
+        cleaned = main_cat.strip()
+        categories.append(cleaned)
+
+    return categories
 
 
 def _iter_amazon_metadata_file(path: Path):

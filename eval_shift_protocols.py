@@ -42,23 +42,23 @@ PROTOCOLS: Dict[str, ProtocolConfig] = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate distribution-shift protocols")
-    parser.add_argument("--data_dir", type=Path, required=True, help="Directory containing original/finetune/test JSONL files")
-    parser.add_argument("--model_dir", type=Path, required=True, help="Directory with the pretrained model weights")
-    parser.add_argument("--tokenizer_dir", type=Path, default=None, help="Tokenizer directory (causal models)")
-    parser.add_argument("--model_type", choices=["bert", "causal"], required=True)
-    parser.add_argument("--protocol", choices=list(PROTOCOLS.keys()), required=True)
-    parser.add_argument("--history_mode", choices=["no_concat", "concat"], default=None)
-    parser.add_argument("--history_window", type=int, default=50)
+    parser.add_argument("--data_dir", type=Path, default="/home/zj/code/STREAM/ml-1m", help="Directory containing original/finetune/test JSONL files")
+    parser.add_argument("--model_dir", type=Path, default="/home/zj/code/STREAM/ml-1m/bert/model", help="Directory with the pretrained model weights")
+    parser.add_argument("--tokenizer_dir", type=Path, default="/home/zj/code/STREAM/ml-1m/causal/tokenizer", help="Tokenizer directory (causal models)")
+    parser.add_argument("--model_type", choices=["bert", "causal"], default="bert")
+    parser.add_argument("--protocol", choices=list(PROTOCOLS.keys()), default="T-FineTune")
+    parser.add_argument("--history_mode", choices=["no_concat", "concat"], default="no_concat")
+    parser.add_argument("--history_window", type=int, default=100)
     parser.add_argument("--metrics_k", nargs="*", type=int, default=[5, 10, 20])
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=17)
-    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--max_prompt_length", type=int, default=256, help="Max tokens for causal prompts")
-    parser.add_argument("--out_dir", type=Path, required=True, help="Directory to store results")
-    parser.add_argument("--finetune_steps", type=int, default=0)
+    parser.add_argument("--out_dir", type=Path, default="/home/zj/code/STREAM/ml-1m/bert", help="Directory to store results")
+    parser.add_argument("--finetune_steps", type=int, default=5)
     parser.add_argument("--finetune_lr", type=float, default=5e-5)
-    parser.add_argument("--finetune_adapter", choices=["none", "lora"], default="none")
+    parser.add_argument("--finetune_adapter", choices=["none", "lora"], default="lora")
     parser.add_argument("--lora_r", type=int, default=16)
     parser.add_argument("--lora_alpha", type=float, default=32.0)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
@@ -379,6 +379,9 @@ def _update_chart(out_dir: Path, results: Dict[str, Dict]) -> None:
     if not all(proto in results for proto in order):
         return
     recalls = [results[proto]["metrics"].get("recall@10", 0.0) for proto in order]
+    import matplotlib
+
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     plt.style.use("seaborn-v0_8-whitegrid")

@@ -35,7 +35,7 @@ PROTOCOLS: Dict[str, ProtocolConfig] = {
     "T-NoConcat": ProtocolConfig(name="T-NoConcat", history_mode="no_concat", eval_split="test"),
     "T-Concat": ProtocolConfig(name="T-Concat", history_mode="concat", eval_split="test"),
     "T-FineTune": ProtocolConfig(
-        name="T-FineTune", history_mode="concat", eval_split="test", requires_finetune=True
+        name="T-FineTune", history_mode="no_concat", eval_split="test", requires_finetune=True
     ),
 }
 
@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tokenizer_dir", type=Path, default=None, help="Tokenizer directory (causal models)")
     parser.add_argument("--model_type", choices=["bert", "causal"], required=True)
     parser.add_argument("--protocol", choices=list(PROTOCOLS.keys()), required=True)
-    parser.add_argument("--history_mode", choices=["no_concat", "concat"], default="concat")
+    parser.add_argument("--history_mode", choices=["no_concat", "concat"], default=None)
     parser.add_argument("--history_window", type=int, default=50)
     parser.add_argument("--metrics_k", nargs="*", type=int, default=[5, 10, 20])
     parser.add_argument("--batch_size", type=int, default=16)
@@ -422,7 +422,9 @@ def main() -> None:
     metrics_k = sorted({int(k) for k in args.metrics_k if k > 0})
     if not metrics_k:
         raise ValueError("At least one positive metrics_k must be provided")
-    if args.history_mode != config.history_mode:
+    if args.history_mode is None:
+        args.history_mode = config.history_mode
+    elif args.history_mode != config.history_mode:
         raise ValueError(
             f"Protocol {args.protocol} enforces history_mode={config.history_mode}; received {args.history_mode}"
         )

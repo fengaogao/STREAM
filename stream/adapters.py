@@ -29,10 +29,14 @@ class LoRALinear(nn.Module):
         self.alpha = float(alpha)
         self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
         self.scaling = self.alpha / max(self.r, 1)
+        device = self.base.weight.device
+        dtype = self.base.weight.dtype
 
         if self.r > 0:
             self.lora_a = nn.Linear(base.in_features, self.r, bias=False)
             self.lora_b = nn.Linear(self.r, base.out_features, bias=False)
+            self.lora_a.to(device=device, dtype=dtype)
+            self.lora_b.to(device=device, dtype=dtype)
             self.reset_parameters()
         else:
             self.register_module("lora_a", nn.Identity())

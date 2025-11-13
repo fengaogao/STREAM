@@ -1,6 +1,6 @@
 """Analysis script for studying category preference drift in STREAM."""
 from __future__ import annotations
-
+import os
 import argparse
 import json
 import logging
@@ -18,6 +18,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import re
 from tqdm import tqdm
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -65,22 +66,29 @@ def set_random_seeds(seed: int) -> None:
 
 
 def _resolve_hf_model_dir(model_root: Path) -> Path:
-    """Return the directory that actually stores the Hugging Face checkpoint."""
-
-    weight_files = {
-        "pytorch_model.bin",
+    # 单文件权重的典型文件名
+    single_weight_files = {
         "model.safetensors",
-        "tf_model.h5",
-        "model.ckpt.index",
+        "pytorch_model.bin",
         "flax_model.msgpack",
+        "model.ckpt.index",
+        "tf_model.h5",
     }
 
+    def _has_config(path: Path) -> bool:
+        return path.is_dir() and (path / "config.json").exists()
+
     def _looks_like_checkpoint(path: Path) -> bool:
-        if not path.is_dir():
+        if not _has_config(path):
             return False
-        if not (path / "config.json").exists():
-            return False
-        return any((path / fname).exists() for fname in weight_files)
+
+        if any((path / f).exists() for f in single_weight_files):
+            return True
+
+        index_ok = (path / "model.safetensors.index.json").exists()
+        shard_ok = any(re.match(r"model-\d{5}-of-\d{5}\.safetensors$", p.name)
+                       for p in path.glob("model-*-of-*.safetensors"))
+        return index_ok and shard_ok
 
     if _looks_like_checkpoint(model_root):
         return model_root
@@ -90,7 +98,12 @@ def _resolve_hf_model_dir(model_root: Path) -> Path:
         LOGGER.info("Detected Hugging Face checkpoint inside %s", candidate)
         return candidate
 
-    expected = " or ".join(sorted(weight_files))
+    for child in model_root.iterdir():
+        if _looks_like_checkpoint(child):
+            LOGGER.info("Detected Hugging Face checkpoint inside %s", child)
+            return child
+
+    expected = " or ".join(sorted(list(single_weight_files) + ["model.safetensors.index.json + shards"]))
     raise FileNotFoundError(
         f"Could not find a Hugging Face checkpoint in '{model_root}'. "
         f"Expected config.json and one of [{expected}]."
@@ -341,84 +354,88 @@ def plot_jsd_histograms(
     jsd_map: Mapping[str, float],
     randomized_jsd: Sequence[float],
     user_interaction_stats: Mapping[str, UserInteractionStats],
-    out_path: Path,
+    out_dir: Path,
     *,
-    bins: int = 40,
+    hist_bins: int = 40,
     interaction_bins: Sequence[int] = (),
+    jsd_hist_max: Optional[float] = None,   # <<-- 可用 main() 里 args.jsd_hist_max 传入
 ) -> None:
     jsd_values = [val for val in jsd_map.values() if not math.isnan(val)]
     if not jsd_values:
         LOGGER.warning("No JSD values available for histogram plot")
         return
+
+    # ===== 计算共享的 bin edges（用于所有图，保证横轴一致）=====
+    max_obs = max(jsd_values) if jsd_values else 0.0
+    max_base = max(randomized_jsd) if randomized_jsd else 0.0
+    x_max = jsd_hist_max if jsd_hist_max is not None else max(max_obs, max_base)
+    if x_max <= 0:
+        x_max = 0.5  # fallback
+    shared_edges = np.linspace(0.0, x_max, hist_bins + 1)
+
+    # ===== 图A：observed vs. baseline =====
+    figA, axA = plt.subplots(figsize=(8, 6))
+    axA.hist(jsd_values, bins=shared_edges, density=True,
+             alpha=0.6, label="observed")
+    if randomized_jsd:
+        axA.hist(randomized_jsd, bins=shared_edges, density=True,
+                 alpha=0.45, label="time-shuffled baseline")
+    median_val = float(np.median(jsd_values))
+    axA.axvline(median_val, color="tab:green", linestyle="--", linewidth=1.5, label="median")
+    axA.set_xlim(0.0, x_max)
+    axA.set_xlabel("Jensen-Shannon divergence")
+    axA.set_ylabel("Density")
+    axA.set_title("User category drift vs. randomized baseline")
+    axA.legend(loc="upper right")
+    (out_dir / "jsd_histograms").mkdir(parents=True, exist_ok=True)
+    figA.tight_layout()
+    figA.savefig(out_dir / "jsd_histograms/jsd_vs_baseline_hist.png", dpi=200)
+    plt.close(figA)
+
+    # ===== 图B：仅“不同交互数量”分桶；不叠加 baseline，不包含 overall =====
     thresholds = sorted(set(interaction_bins))
     if thresholds and 0 not in thresholds:
         thresholds.insert(0, 0)
-    bins: List[Tuple[int, Optional[int]]] = []
+
+    interaction_ranges: List[Tuple[int, Optional[int]]] = []
     if thresholds:
         for idx, lower in enumerate(thresholds):
-            upper: Optional[int]
-            if idx + 1 < len(thresholds):
-                upper = thresholds[idx + 1]
-            else:
-                upper = None
-            bins.append((lower, upper))
-    num_subplots = 1 + (len(bins) if bins else 0)
-    fig, axes = plt.subplots(num_subplots, 1, figsize=(8, 4 * num_subplots))
+            upper: Optional[int] = thresholds[idx + 1] if idx + 1 < len(thresholds) else None
+            interaction_ranges.append((lower, upper))
+
+    if not interaction_ranges:
+        return
+
+    figB, axes = plt.subplots(len(interaction_ranges), 1, figsize=(8, 4 * len(interaction_ranges)), sharex=True)
     if not isinstance(axes, np.ndarray):
         axes = np.array([axes])
 
-    overall_ax = axes[0]
-    density = True
-    overall_ax.hist(jsd_values, bins=bins, color="tab:blue", alpha=0.6, density=density, label="observed")
-    if randomized_jsd:
-        overall_ax.hist(
-            randomized_jsd,
-            bins=bins,
-            color="tab:orange",
-            alpha=0.45,
-            density=density,
-            label="time-shuffled baseline",
-        )
-    mean_val = float(np.mean(jsd_values))
-    median_val = float(np.median(jsd_values))
-    p95_val = float(np.percentile(jsd_values, 95))
-    for value, label, style in [
-        (mean_val, "mean", ("tab:red", "-")),
-        (median_val, "median", ("tab:green", "--")),
-        (p95_val, "95th pct", ("tab:purple", ":")),
-    ]:
-        overall_ax.axvline(value, color=style[0], linestyle=style[1], linewidth=1.5, label=label)
-    overall_ax.set_xlabel("Jensen-Shannon divergence")
-    overall_ax.set_ylabel("Density")
-    overall_ax.set_title("User category drift vs. randomized baseline")
-    overall_ax.legend(loc="upper right")
-
-    if bins:
-        for idx, (lower, upper) in enumerate(bins):
-            ax = axes[idx + 1]
-            label = f">={lower}" if upper is None else f"{lower}-{upper}"
-            values = []
-            for user_id, stats in user_interaction_stats.items():
-                total = stats.total
-                if total < lower:
-                    continue
-                if upper is not None and total >= upper:
-                    continue
-                jsd_val = jsd_map.get(user_id)
-                if jsd_val is None or math.isnan(jsd_val):
-                    continue
-                values.append(jsd_val)
-            if not values:
-                ax.set_visible(False)
+    for ax, (lower, upper) in zip(axes, interaction_ranges):
+        label = f">={lower}" if upper is None else f"{lower}-{upper}"
+        values = []
+        for user_id, stats in user_interaction_stats.items():
+            total = stats.total
+            if total < lower:
                 continue
-            ax.hist(values, bins=bins, color="tab:blue", alpha=0.7)
-            ax.set_xlabel("Jensen-Shannon divergence")
-            ax.set_ylabel("Number of users")
-            ax.set_title(f"Users with total interactions in [{label})")
+            if upper is not None and total >= upper:
+                continue
+            jsd_val = jsd_map.get(user_id)
+            if jsd_val is None or math.isnan(jsd_val):
+                continue
+            values.append(jsd_val)
+        if not values:
+            ax.set_visible(False)
+            continue
+        ax.hist(values, bins=shared_edges, alpha=0.75)
+        ax.set_ylabel("Number of users")
+        ax.set_title(f"Users with total interactions in [{label})")
 
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=200)
-    plt.close(fig)
+    axes[-1].set_xlim(0.0, x_max)  # 统一横轴范围
+    axes[-1].set_xlabel("Jensen-Shannon divergence")
+    figB.tight_layout()
+    figB.savefig(out_dir / "jsd_histograms/jsd_by_interaction_bins.png", dpi=200)
+    plt.close(figB)
+
 
 
 def plot_user_category_heatmaps(
@@ -934,6 +951,8 @@ def compute_direction_subspace_drift(
         batch_device = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
         with torch.no_grad():
             hidden = model.stream_hidden_states(batch_device)
+        if basis_device.dtype != hidden.dtype:
+            basis_device = basis_device.to(hidden.dtype)
         projections = hidden @ basis_device
         projections = projections.detach().cpu()
         for proj, meta in zip(projections, meta_batch):
@@ -954,7 +973,7 @@ def compute_direction_subspace_drift(
                     {
                         "time_index": meta["time_index"],
                         "segment": segment,
-                        "projection": proj.numpy().tolist(),
+                        "projection": proj.to(torch.float32).numpy().tolist(),
                     }
                 )
 
@@ -1057,12 +1076,14 @@ def plot_user_trajectories(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Category drift analysis for STREAM")
-    parser.add_argument("--data_dir", type=Path, default="/home/zj/code/STREAM/ml-10M100K")
-    parser.add_argument("--model_dir", type=Path, default="/home/zj/code/STREAM/ml-10M100K/bert")
-    parser.add_argument("--out_dir", type=Path, default="/home/zj/code/STREAM/ml-10M100K/bert")
+    parser.add_argument("--data_dir", type=Path, default="/home/zj/code/STREAM/ml-1m")
+    parser.add_argument("--model_dir", type=Path, default="/home/zj/code/STREAM/ml-1m/bert")
+    parser.add_argument("--tokenizer_dir", type=Path, default="/home/zj/code/STREAM/ml-1m/causal/tokenizer",
+                        help="Directory that has tokenizer.json/tokenizer.model when model_dir lacks them")
+    parser.add_argument("--out_dir", type=Path, default="/home/zj/code/STREAM/ml-1m/bert")
     parser.add_argument("--max_users", type=int, default=None, help="Limit analysis to the first N users")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--hist_bins", type=int, default=40, help="Number of bins for JSD histogram")
+    parser.add_argument("--hist_bins", type=int, default=100, help="Number of bins for JSD histogram")
     parser.add_argument(
         "--interaction_bins",
         type=int,
@@ -1077,7 +1098,7 @@ def parse_args() -> argparse.Namespace:
         default=10,
         help="Number of median-drift users to visualize",
     )
-    parser.add_argument("--heatmap_categories", type=int, default=20, help="Maximum categories in heatmap plot")
+    parser.add_argument("--heatmap_categories", type=int, default=30, help="Maximum categories in heatmap plot")
     parser.add_argument(
         "--heatmap_min_interactions",
         type=int,
@@ -1087,12 +1108,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--random_baseline_samples",
         type=int,
-        default=50,
+        default=300,
         help="Number of shuffles per user when building the randomized JSD baseline",
     )
     parser.add_argument("--eval_batch_size", type=int, default=32, help="Batch size for evaluation")
     parser.add_argument("--num_workers", type=int, default=0, help="Number of DataLoader workers")
-    parser.add_argument("--device", type=str, default=None, help="Device for model execution (e.g. cuda)")
+    parser.add_argument("--device", type=str, default="cuda:1", help="Device for model execution (e.g. cuda)")
     parser.add_argument(
         "--model_type",
         type=str,
@@ -1105,7 +1126,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--drift_low_threshold", type=float, default=0.05, help="Maximum early probability for drift classification")
     parser.add_argument("--drift_late_threshold", type=float, default=0.2, help="Minimum late probability for drift classification")
     parser.add_argument("--metric_ks", type=int, nargs="*", default=[5, 10, 20], help="Ranking cutoffs")
-    parser.add_argument("--metrics_plot", type=str, nargs="*", default=["ndcg@10", "recall@20"], help="Metrics to visualise in bar plot")
+    parser.add_argument("--metrics_plot", type=str, nargs="*", default=["ndcg@20", "recall@20"], help="Metrics to visualise in bar plot")
     parser.add_argument(
         "--jsd_quantile_bins",
         type=int,
@@ -1197,13 +1218,11 @@ def main() -> None:
         seed=args.seed,
     )
     plot_jsd_histograms(
-        jsd_map,
-        randomized_jsd,
-        user_interaction_stats,
-        out_dir / "jsd_hist.png",
-        bins=args.hist_bins,
+        jsd_map, randomized_jsd, user_interaction_stats, out_dir,
+        hist_bins=args.hist_bins,
         interaction_bins=args.interaction_bins,
     )
+
     jsd_summary = summarize_jsd_statistics(jsd_map, user_interaction_stats, args.interaction_bins)
     save_json(jsd_summary, out_dir / "jsd_summary.json")
 
@@ -1257,6 +1276,7 @@ def main() -> None:
     else:
         model = CausalLMStreamModel(
             pretrained_name_or_path=str(hf_model_dir),
+            tokenizer_name_or_path = args.tokenizer_dir,
             item_vocab=item_vocab,
             device=device,
         )

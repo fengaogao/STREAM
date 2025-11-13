@@ -129,7 +129,7 @@ def build_protocol_examples(
                 continue
             for item in test_sequence:
                 examples.append(ShiftEvalExample(user=user, history=list(history), target=item, source_split="test"))
-    elif protocol in {"T-CONCAT", "T-FINETUNE"}:
+    elif protocol == "T-CONCAT":
         for user, test_sequence in test.items():
             if not test_sequence:
                 continue
@@ -142,6 +142,20 @@ def build_protocol_examples(
                     continue
                 examples.append(ShiftEvalExample(user=user, history=list(window), target=item, source_split="test"))
                 history.append(item)
+    elif protocol == "T-FINETUNE":
+        for user, test_sequence in test.items():
+            if not test_sequence:
+                continue
+            base_history = original.get(user, [])
+            if not base_history:
+                continue
+            window = list(base_history[-history_window:])
+            if not window:
+                continue
+            for item in test_sequence:
+                examples.append(
+                    ShiftEvalExample(user=user, history=list(window), target=item, source_split="test")
+                )
     else:
         raise ValueError(f"Unknown protocol: {protocol}")
 

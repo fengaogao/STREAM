@@ -40,8 +40,8 @@ LOGGER = get_logger(__name__)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Offline training for STREAM")
-    parser.add_argument("--data_dir", type=Path, default="/home/zj/code/STREAM/Amazon_electronics")
-    parser.add_argument("--out_dir", type=Path, default="/home/zj/code/STREAM/Amazon_electronics/bert")
+    parser.add_argument("--data_dir", type=Path, default="/home/zj/code/STREAM/ml-1m")
+    parser.add_argument("--out_dir", type=Path, default="/home/zj/code/STREAM/ml-1m/bert")
     parser.add_argument("--model_type", choices=["causal", "bert"], default="bert")
     parser.add_argument("--pretrained_name_or_path", type=str, default="/home/zj/model/Llama-2-7b-hf")
     parser.add_argument(
@@ -52,8 +52,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--router_k", type=int, default=16)
     parser.add_argument("--subspace_mode", choices=["gradcov", "pca"], default="gradcov")
-    parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument(
         "--grad_accumulation_steps",
         type=int,
@@ -1218,6 +1218,8 @@ def main() -> None:
     model_dir.mkdir(exist_ok=True)
     model.model.save_pretrained(model_dir)
     if args.model_type == "causal":
+        # tokenizer_dir = out_dir / "tokenizer"
+        # tokenizer.save_pretrained(model_dir)
         tokenizer_dir = out_dir / "tokenizer"
         tokenizer.save_pretrained(tokenizer_dir)
 

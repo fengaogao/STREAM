@@ -5,6 +5,10 @@ This directory contains reproducible scripts for the two requested analyses on t
 * **Experiment A (Alignment / Decoupling)** – measures how well the latent directions discovered by truncated SVD align with human genres. The script saves a direction-vs-genre cosine heatmap alongside quantitative diagnostics (diagonal energy ratio, maximum cross response, etc.).
 * **Experiment B (Controllability / Causality)** – probes whether nudging logits along a genre-aligned direction boosts that genre while minimally perturbing others. It emits a dose–response curve (Δlogit and ΔNDCG) and a top-k recall improvement bar chart.
 
+Additional tooling:
+
+* **`category_direction_benefit.py`** – aggregates the effect of a single category-aligned direction across many evaluation samples, contrasting its impact on recall/probability metrics against random directions.
+
 ## Usage
 
 ```bash
@@ -29,6 +33,23 @@ The command will create `experiments/outputs/` with:
 * `experiment_b_summary_<GENRE>.json` – machine-readable metrics for downstream analysis.
 
 Pass a different `--target_genre` to inspect another category or override `--alphas` / `--topk` for alternative perturbation grids.
+
+### Aggregated category-direction comparison
+
+To quantify how a learnt direction reshapes ranking quality, run:
+
+```bash
+python -m experiments.category_direction_benefit \
+    --data_dir /path/to/ml-10m \
+    --artifacts_dir /path/to/ml-10m/bert \
+    --category Drama \
+    --num_samples 2048 \
+    --top_k 10 \
+    --alpha 0.8 \
+    --random_trials 10
+```
+
+The script reports aggregated recall, target-probability, and category-mass metrics for the selected genre alongside a random-direction baseline, illustrating whether the learnt direction offers a measurable advantage.
 
 ## Implementation notes
 

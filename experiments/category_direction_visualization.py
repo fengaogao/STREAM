@@ -226,7 +226,7 @@ def main() -> None:
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size for the evaluation dataloader")
     parser.add_argument("--sample_index", type=int, default=None, help="Select the N-th sample in iteration order (after filtering)")
     parser.add_argument("--max_batches", type=int, default=None, help="Limit the number of dataloader batches to scan")
-    parser.add_argument("--alpha", type=float, default=1, help="Scaling applied to the category direction")
+    parser.add_argument("--alpha", type=float, default=0.8, help="Scaling applied to the category direction")
     parser.add_argument("--optim_steps", type=int, default=200, help="Gradient ascent steps for the optimal hidden state")
     parser.add_argument("--optim_lr", type=float, default=0.001, help="Learning rate for hidden state optimisation")
     parser.add_argument("--l2_weight", type=float, default=1e-2, help="Regularisation weight keeping h close to original")

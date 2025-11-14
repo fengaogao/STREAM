@@ -124,24 +124,40 @@ def build_protocol_examples(
         for user, test_sequence in test.items():
             if not test_sequence:
                 continue
-            history = original.get(user, [])[-history_window:]
-            if not history:
+            history = list(original.get(user, []))
+            window = history[-history_window:] if history_window > 0 else list(history)
+            if not window:
                 continue
             for item in test_sequence:
-                examples.append(ShiftEvalExample(user=user, history=list(history), target=item, source_split="test"))
+                examples.append(
+                    ShiftEvalExample(
+                        user=user,
+                        history=list(window),
+                        target=item,
+                        source_split="test",
+                    )
+                )
+                window = (window + [item])[-history_window:] if history_window > 0 else []
     elif protocol == "T-CONCAT":
         for user, test_sequence in test.items():
             if not test_sequence:
                 continue
             history = list(original.get(user, []))
             history.extend(finetune.get(user, []))
+            window = history[-history_window:] if history_window > 0 else list(history)
+            if not window:
+                continue
             for item in test_sequence:
-                window = history[-history_window:]
-                if not window:
-                    history.append(item)
-                    continue
-                examples.append(ShiftEvalExample(user=user, history=list(window), target=item, source_split="test"))
+                examples.append(
+                    ShiftEvalExample(
+                        user=user,
+                        history=list(window),
+                        target=item,
+                        source_split="test",
+                    )
+                )
                 history.append(item)
+                window = history[-history_window:] if history_window > 0 else list(history)
     elif protocol == "T-FINETUNE":
         for user, test_sequence in test.items():
             if not test_sequence:
@@ -149,13 +165,19 @@ def build_protocol_examples(
             base_history = original.get(user, [])
             if not base_history:
                 continue
-            window = list(base_history[-history_window:])
+            window = list(base_history[-history_window:]) if history_window > 0 else list(base_history)
             if not window:
                 continue
             for item in test_sequence:
                 examples.append(
-                    ShiftEvalExample(user=user, history=list(window), target=item, source_split="test")
+                    ShiftEvalExample(
+                        user=user,
+                        history=list(window),
+                        target=item,
+                        source_split="test",
+                    )
                 )
+                window = (window + [item])[-history_window:] if history_window > 0 else []
     else:
         raise ValueError(f"Unknown protocol: {protocol}")
 

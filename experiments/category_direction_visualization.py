@@ -216,19 +216,19 @@ def _select_sample(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Visualise category-aligned hidden state manipulations")
-    parser.add_argument("--data_dir", type=Path, required=True, help="Dataset directory used for offline training")
-    parser.add_argument("--artifacts_dir", type=Path, required=True, help="Directory containing offline training artifacts")
-    parser.add_argument("--model_type", choices=["causal", "bert"], required=True, help="Base model architecture")
+    parser.add_argument("--data_dir", type=Path, default="/home/zj/code/STREAM/ml-1m", help="Dataset directory used for offline training")
+    parser.add_argument("--artifacts_dir", type=Path, default="/home/zj/code/STREAM/ml-1m/bert", help="Directory containing offline training artifacts")
+    parser.add_argument("--model_type", choices=["causal", "bert"], default="bert", help="Base model architecture")
     parser.add_argument("--output", type=Path, default=Path("category_direction_visualisation.png"), help="Output image path")
     parser.add_argument("--category", type=str, default=None, help="Category name to visualise")
     parser.add_argument("--direction_index", type=int, default=None, help="Fallback direction index if category is not provided")
-    parser.add_argument("--split", type=str, default="finetune", help="Dataset split to draw samples from")
+    parser.add_argument("--split", type=str, default="original", help="Dataset split to draw samples from")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size for the evaluation dataloader")
     parser.add_argument("--sample_index", type=int, default=None, help="Select the N-th sample in iteration order (after filtering)")
     parser.add_argument("--max_batches", type=int, default=None, help="Limit the number of dataloader batches to scan")
-    parser.add_argument("--alpha", type=float, default=1.0, help="Scaling applied to the category direction")
+    parser.add_argument("--alpha", type=float, default=1, help="Scaling applied to the category direction")
     parser.add_argument("--optim_steps", type=int, default=200, help="Gradient ascent steps for the optimal hidden state")
-    parser.add_argument("--optim_lr", type=float, default=0.1, help="Learning rate for hidden state optimisation")
+    parser.add_argument("--optim_lr", type=float, default=0.001, help="Learning rate for hidden state optimisation")
     parser.add_argument("--l2_weight", type=float, default=1e-2, help="Regularisation weight keeping h close to original")
     parser.add_argument("--match_norm", action="store_true", help="Project optimised hidden state to match the original norm")
     parser.add_argument("--arrow_scale", type=float, default=1.0, help="Extra scale applied when drawing the category direction arrow")
@@ -335,22 +335,22 @@ def main() -> None:
     ax.legend(loc="best")
     ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
 
-    text_lines = [
-        f"p(target): original={_format_metrics(probs_original)}",
-        f"            shifted={_format_metrics(probs_shifted)}",
-        f"            optimal={_format_metrics(probs_optimal)}",
-        f"cos(h, h+Δ)={_format_metrics(cos_original_shifted)}",
-        f"cos(h, h*)={_format_metrics(cos_original_optimal)}",
-        f"cos(h+Δ, h*)={_format_metrics(cos_shifted_optimal)}",
-    ]
-    if category_direction.meta:
-        meta_str = ", ".join(f"{k}={v}" for k, v in category_direction.meta.items() if k != "category")
-        if meta_str:
-            text_lines.append(f"direction meta: {meta_str}")
-    ax.text(0.02, 0.02, "\n".join(text_lines), transform=ax.transAxes, fontsize=10, va="bottom")
+    # text_lines = [
+    #     f"p(target): original={_format_metrics(probs_original)}",
+    #     f"            shifted={_format_metrics(probs_shifted)}",
+    #     f"            optimal={_format_metrics(probs_optimal)}",
+    #     f"cos(h, h+Δ)={_format_metrics(cos_original_shifted)}",
+    #     f"cos(h, h*)={_format_metrics(cos_original_optimal)}",
+    #     f"cos(h+Δ, h*)={_format_metrics(cos_shifted_optimal)}",
+    # ]
+    # if category_direction.meta:
+    #     meta_str = ", ".join(f"{k}={v}" for k, v in category_direction.meta.items() if k != "category")
+    #     if meta_str:
+    #         text_lines.append(f"direction meta: {meta_str}")
+    # ax.text(0.02, 0.02, "\n".join(text_lines), transform=ax.transAxes, fontsize=10, va="bottom")
 
     fig.tight_layout()
-    fig.savefig(args.output, dpi=200)
+    fig.savefig(args.output, dpi=300)
     plt.close(fig)
 
     print("=== Experiment summary ===")

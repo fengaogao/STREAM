@@ -227,6 +227,18 @@ def main() -> None:
     parser.add_argument("--sample_index", type=int, default=None, help="Select the N-th sample in iteration order (after filtering)")
     parser.add_argument("--max_batches", type=int, default=None, help="Limit the number of dataloader batches to scan")
     parser.add_argument("--alpha", type=float, default=0.8, help="Scaling applied to the category direction")
+    parser.add_argument(
+        "--alpha_max",
+        type=float,
+        default=1.5,
+        help="Maximum absolute value of alpha scanned when searching for the best point along the category direction",
+    )
+    parser.add_argument(
+        "--num_alpha",
+        type=int,
+        default=31,
+        help="Number of samples in the alpha sweep (should be an odd number to include zero)",
+    )
     parser.add_argument("--optim_steps", type=int, default=200, help="Gradient ascent steps for the optimal hidden state")
     parser.add_argument("--optim_lr", type=float, default=0.001, help="Learning rate for hidden state optimisation")
     parser.add_argument("--l2_weight", type=float, default=1e-2, help="Regularisation weight keeping h close to original")
@@ -235,6 +247,11 @@ def main() -> None:
     parser.add_argument("--device", type=str, default="cuda", help="Torch device to run on")
     parser.add_argument("--seed", type=int, default=17, help="Random seed for reproducibility")
     args = parser.parse_args()
+
+    if args.num_alpha < 3:
+        raise ValueError("num_alpha must be at least 3 to explore points on both sides of the origin")
+    if args.alpha_max <= 0:
+        raise ValueError("alpha_max must be positive")
 
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
     set_seed(args.seed)
@@ -274,11 +291,24 @@ def main() -> None:
     batch_device = move_batch_to_device(raw_batch, device)
     hidden = model.stream_hidden_states(batch_device)[0]
     direction_vec = category_direction.vector.to(hidden.device, dtype=hidden.dtype)
-    manipulated = hidden + args.alpha * direction_vec
+    manipulated_default = hidden + args.alpha * direction_vec
+
+    alpha_values = torch.linspace(-args.alpha_max, args.alpha_max, args.num_alpha, device=hidden.device)
+    hidden_sweep = hidden.unsqueeze(0) + alpha_values.unsqueeze(1) * direction_vec.unsqueeze(0)
 
     weight, bias = _load_item_linear_params(model)
     weight = weight.to(hidden.device, dtype=hidden.dtype)
     bias = bias.to(hidden.device, dtype=hidden.dtype) if bias is not None else None
+
+    logits_sweep = torch.matmul(hidden_sweep, weight.t())
+    if bias is not None:
+        logits_sweep = logits_sweep + bias
+    probs_sweep = torch.softmax(logits_sweep, dim=-1)[:, target_item]
+    best_idx = torch.argmax(probs_sweep)
+    best_alpha = alpha_values[best_idx].item()
+    manipulated_best = hidden + best_alpha * direction_vec
+
+    manipulated = manipulated_default
 
     optimal = _optimise_hidden(
         hidden,
@@ -293,28 +323,47 @@ def main() -> None:
 
     logits_original = _compute_logits(hidden, weight, bias)
     logits_shifted = _compute_logits(manipulated, weight, bias)
+    logits_best = _compute_logits(manipulated_best, weight, bias)
     logits_optimal = _compute_logits(optimal, weight, bias)
     probs_original = torch.softmax(logits_original, dim=0)[target_item].item()
     probs_shifted = torch.softmax(logits_shifted, dim=0)[target_item].item()
+    probs_best = torch.softmax(logits_best, dim=0)[target_item].item()
     probs_optimal = torch.softmax(logits_optimal, dim=0)[target_item].item()
 
     cos_original_shifted = F.cosine_similarity(hidden.unsqueeze(0), manipulated.unsqueeze(0)).item()
+    cos_original_best = F.cosine_similarity(hidden.unsqueeze(0), manipulated_best.unsqueeze(0)).item()
     cos_original_optimal = F.cosine_similarity(hidden.unsqueeze(0), optimal.unsqueeze(0)).item()
     cos_shifted_optimal = F.cosine_similarity(manipulated.unsqueeze(0), optimal.unsqueeze(0)).item()
+    cos_best_optimal = F.cosine_similarity(manipulated_best.unsqueeze(0), optimal.unsqueeze(0)).item()
 
-    projected, basis = _project_vectors([hidden, manipulated, optimal])
-    proj_hidden, proj_shifted, proj_optimal = projected.cpu().numpy()
+    projected, basis = _project_vectors([hidden, manipulated, manipulated_best, optimal])
+    proj_hidden, proj_shifted, proj_best, proj_optimal = projected.cpu().numpy()
     proj_direction = (direction_vec @ basis).cpu().numpy()
     arrow_dx = args.alpha * args.arrow_scale * proj_direction[0]
     arrow_dy = args.alpha * args.arrow_scale * proj_direction[1]
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    fig, ax = plt.subplots(figsize=(8, 6))
-    ax.scatter(proj_hidden[0], proj_hidden[1], color="#1f77b4", label="Original h", s=80)
-    ax.scatter(proj_shifted[0], proj_shifted[1], color="#ff7f0e", label="h + category", s=80)
-    ax.scatter(proj_optimal[0], proj_optimal[1], color="#2ca02c", label="Optimised h*", s=80)
-    ax.plot([proj_hidden[0], proj_optimal[0]], [proj_hidden[1], proj_optimal[1]], "k--", linewidth=1.0, label="h → h*")
-    ax.arrow(
+    fig, (ax_space, ax_prob) = plt.subplots(1, 2, figsize=(12, 6))
+    ax_space.scatter(proj_hidden[0], proj_hidden[1], color="#1f77b4", label="Original h", s=80)
+    ax_space.scatter(
+        proj_shifted[0], proj_shifted[1], color="#ff7f0e", label=f"h + α={args.alpha:.2f}", s=80
+    )
+    ax_space.scatter(
+        proj_best[0],
+        proj_best[1],
+        color="#9467bd",
+        label=f"Best along dir (α={best_alpha:.2f})",
+        s=80,
+    )
+    ax_space.scatter(proj_optimal[0], proj_optimal[1], color="#2ca02c", label="Optimised h*", s=80)
+    ax_space.plot(
+        [proj_hidden[0], proj_optimal[0]],
+        [proj_hidden[1], proj_optimal[1]],
+        "k--",
+        linewidth=1.0,
+        label="h → h*",
+    )
+    ax_space.arrow(
         proj_hidden[0],
         proj_hidden[1],
         arrow_dx,
@@ -326,14 +375,24 @@ def main() -> None:
         label=f"Category direction ({category_direction.name})",
     )
 
-    ax.set_xlabel("PC1")
-    ax.set_ylabel("PC2")
-    ax.set_title(
+    ax_space.set_xlabel("PC1")
+    ax_space.set_ylabel("PC2")
+    ax_space.set_title(
         "Category direction effect\n"
         f"Sample #{sample_idx}, target item {target_item}, direction '{category_direction.name}'"
     )
-    ax.legend(loc="best")
-    ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
+    ax_space.legend(loc="best")
+    ax_space.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
+
+    ax_prob.plot(alpha_values.cpu().numpy(), probs_sweep.cpu().numpy(), color="#1f77b4")
+    ax_prob.axvline(args.alpha, color="#ff7f0e", linestyle="--", label=f"α default ({args.alpha:.2f})")
+    ax_prob.axvline(best_alpha, color="#9467bd", linestyle=":", label=f"α best ({best_alpha:.2f})")
+    ax_prob.set_xlabel("α (scaling of category direction)")
+    ax_prob.set_ylabel("p(target item)")
+    ax_prob.set_title("Target probability along category direction")
+    ax_prob.set_ylim(0.0, max(1.0, probs_sweep.max().item() * 1.05))
+    ax_prob.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
+    ax_prob.legend(loc="best")
 
     # text_lines = [
     #     f"p(target): original={_format_metrics(probs_original)}",
@@ -359,10 +418,13 @@ def main() -> None:
     print(f"Category direction: {category_direction.name} (index={category_direction.index})")
     print(f"Original probability: {probs_original:.6f}")
     print(f"Shifted probability: {probs_shifted:.6f}")
+    print(f"Best-direction probability: {probs_best:.6f} (alpha={best_alpha:.4f})")
     print(f"Optimal probability: {probs_optimal:.6f}")
     print(f"cos(h, h+Δ): {cos_original_shifted:.6f}")
+    print(f"cos(h, h+α*) : {cos_original_best:.6f}")
     print(f"cos(h, h*): {cos_original_optimal:.6f}")
     print(f"cos(h+Δ, h*): {cos_shifted_optimal:.6f}")
+    print(f"cos(h+α*, h*): {cos_best_optimal:.6f}")
     print(f"Plot saved to: {args.output}")
 
 
